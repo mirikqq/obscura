@@ -77,6 +77,19 @@ pub struct BrowserState {
     /// table is wiped on every navigation / tab switch and refilled on
     /// the next snapshot call.
     interactive_refs: HashMap<String, NodeId>,
+    /// Where the pointer was left by the last click, in CSS pixels.
+    ///
+    /// A trajectory needs somewhere to start from, and starting every move at
+    /// the same point would be its own pattern. Carrying the position forward
+    /// means successive clicks trace one continuous path, which is what a
+    /// person's pointer does.
+    #[cfg(feature = "stealth")]
+    mouse: (f32, f32),
+    /// Per-session input model: handedness, Fitts's-Law constants, typing
+    /// speed. Seeded once per session so the timing is consistent for this
+    /// identity rather than freshly random per action.
+    #[cfg(feature = "stealth")]
+    behavior: obscura_stealth::BehaviorProfile,
 }
 
 impl BrowserState {
@@ -89,6 +102,10 @@ impl BrowserState {
             user_agent,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
+            #[cfg(feature = "stealth")]
+            mouse: (0.0, 0.0),
+            #[cfg(feature = "stealth")]
+            behavior: obscura_stealth::BehaviorProfile::default(),
         }
     }
 
@@ -993,6 +1010,19 @@ fn tool_snapshot(args: &Value, state: &mut BrowserState) -> Result<String, Strin
 async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = resolve_target(args, state)?;
 
+    // Move the pointer there before clicking, when stealth is on.
+    //
+    // A bare `el.click()` produces an activation with no pointer history at
+    // all: no mousemove, no mouseover, no mousedown/mouseup, and a click whose
+    // coordinates are (0, 0). Behavioural checks do not need a model to catch
+    // that -- the absence of the events is the signal. The trajectory itself
+    // is a Sigma-Lognormal / Fitts's-Law model, so the move takes a plausible
+    // time for the distance and the target size.
+    #[cfg(feature = "stealth")]
+    if state.context.stealth {
+        move_pointer_to(&selector, state);
+    }
+
     let js = format!(
         r#"(function(){{
             var el = document.querySelector({sel});
@@ -1013,6 +1043,82 @@ async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, St
         state.settle_synthetic_navigation().await?;
         Ok(format!("Clicked '{selector}'"))
     }
+}
+
+/// Trace a humanlike pointer path to `selector` and leave the pointer on it.
+///
+/// Best-effort and deliberately non-fatal: the click itself is still issued by
+/// `tool_click`, so a page with no layout information (a `--no-render` build,
+/// or an element with no box) simply gets the click it would have got before.
+/// The pointer events are added telemetry, never the activation path -- which
+/// is what keeps this from changing what a click *does*.
+#[cfg(feature = "stealth")]
+fn move_pointer_to(selector: &str, state: &mut BrowserState) {
+    let rect_js = format!(
+        r#"(function(){{
+            var el = document.querySelector({sel});
+            if (!el || !el.getBoundingClientRect) return null;
+            var r = el.getBoundingClientRect();
+            if (!r || (!r.width && !r.height)) return null;
+            return [r.left, r.top, r.width, r.height];
+        }})()"#,
+        sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
+    );
+    let rect = state.page_mut().evaluate(&rect_js);
+    let Some(rect) = rect.as_array().filter(|rect| rect.len() == 4) else {
+        return;
+    };
+    let value = |index: usize| rect[index].as_f64().unwrap_or(0.0) as f32;
+    let (left, top, width, height) = (value(0), value(1), value(2), value(3));
+
+    // Aim inside the target rather than dead centre; the input model decides
+    // where, from the session RNG.
+    let target = state
+        .behavior
+        .aim_point(selector.len() as u64, left, top, width, height);
+
+    let path = obscura_stealth::behavior::mouse_trajectory(
+        state.mouse,
+        target,
+        width.max(1.0),
+        &state.behavior,
+    );
+    if path.is_empty() {
+        return;
+    }
+
+    let points: Vec<serde_json::Value> = path
+        .iter()
+        .map(|point| serde_json::json!([point.x, point.y]))
+        .collect();
+    let dispatch_js = format!(
+        r#"(function(){{
+            var el = document.querySelector({sel});
+            if (!el) return "no-element";
+            var pts = {pts};
+            function fire(type, x, y, extra) {{
+                var init = Object.assign({{
+                    bubbles: true, cancelable: true, composed: true,
+                    clientX: x, clientY: y, screenX: x, screenY: y,
+                    view: globalThis,
+                }}, extra || {{}});
+                var ev = new MouseEvent(type, init);
+                el.dispatchEvent(globalThis.__obscura_markTrusted
+                    ? globalThis.__obscura_markTrusted(ev) : ev);
+            }}
+            var last = pts[pts.length - 1];
+            fire('mouseover', last[0], last[1]);
+            fire('mouseenter', last[0], last[1]);
+            for (var i = 0; i < pts.length; i++) fire('mousemove', pts[i][0], pts[i][1]);
+            fire('mousedown', last[0], last[1], {{ button: 0, buttons: 1 }});
+            fire('mouseup', last[0], last[1], {{ button: 0, buttons: 0 }});
+            return "ok";
+        }})()"#,
+        sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
+        pts = serde_json::to_string(&points).unwrap_or_else(|_| "[]".into()),
+    );
+    let _ = state.page_mut().evaluate(&dispatch_js);
+    state.mouse = target;
 }
 
 async fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, String> {

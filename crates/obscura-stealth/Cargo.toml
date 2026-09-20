@@ -1,0 +1,32 @@
+[package]
+name = "obscura-stealth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Coherent browser-identity profiles for Obscura: fingerprint, locale and transport identity kept consistent with each other."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = "0.10"
+tracing = { workspace = true }
+rand = "0.10"
+rand_chacha = "0.10"
+rand_distr = "0.6"
+
+# Bayesian-network fingerprint sampling (BrowserForge-compatible). The network
+# is embedded in the crate, so sampling needs no runtime file IO or download.
+veilus-fingerprint = { version = "0.3.1", optional = true }
+
+# GeoLite2 reader for resolving the egress address to a position, the way
+# Camoufox derives timezone/locale/geolocation from the proxy IP.
+maxminddb = { version = "0.26", optional = true }
+
+[features]
+default = ["generator", "geoip"]
+generator = ["dep:veilus-fingerprint"]
+geoip = ["dep:maxminddb"]
+
+[lib]
+path = "src/lib.rs"

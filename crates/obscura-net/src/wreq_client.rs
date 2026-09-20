@@ -57,20 +57,41 @@ impl wreq::dns::Resolve for SsrfGuardResolver {
     }
 }
 
+// The identity the wire and the JS surface must agree on now lives in one
+// place: `obscura_stealth::StealthProfile`, whose `validate()` rejects a
+// profile whose user agent, platform and TLS stack contradict each other. These
+// constants are what the default profile reports, kept for callers that only
+// need the default identity's strings.
 #[cfg(feature = "stealth")]
-pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+fn default_stealth_profile() -> &'static obscura_stealth::StealthProfile {
+    static PROFILE: std::sync::OnceLock<obscura_stealth::StealthProfile> =
+        std::sync::OnceLock::new();
+    PROFILE.get_or_init(obscura_stealth::select)
+}
 
-// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
-// UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
-// same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
-// site cross-checks the mismatch as a bot signal.
+/// The user agent the default profile reports.
 #[cfg(feature = "stealth")]
-pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
+pub fn stealth_user_agent() -> &'static str {
+    &default_stealth_profile().user_agent
+}
+
+/// `navigator.platform` for the default profile.
 #[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM: &str = "Windows";
+pub fn stealth_navigator_platform() -> &'static str {
+    &default_stealth_profile().platform
+}
+
+/// The `sec-ch-ua-platform` value for the default profile.
 #[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
+pub fn stealth_ua_platform() -> &'static str {
+    &default_stealth_profile().os_name
+}
+
+/// The `sec-ch-ua-platform-version` value for the default profile.
+#[cfg(feature = "stealth")]
+pub fn stealth_ua_platform_version() -> &'static str {
+    &default_stealth_profile().platform_version
+}
 
 #[cfg(feature = "stealth")]
 fn tracker_blocking_enabled(value: Option<&str>) -> bool {
@@ -186,6 +207,9 @@ async fn send_get_with_connection_reset_retry(
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
+    /// The identity this client wears. The JS surface reads the same object, so
+    /// navigator and the ClientHello cannot describe different browsers.
+    profile: Arc<obscura_stealth::StealthProfile>,
     allow_private_network: bool,
     pub block_trackers: bool,
     pub cookie_jar: Arc<CookieJar>,
@@ -204,10 +228,32 @@ impl StealthHttpClient {
         proxy_url: Option<&str>,
         allow_private_network: bool,
     ) -> Self {
-        let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
-            .platform(wreq_util::Platform::Windows)
-            .build();
+        Self::with_profile(
+            cookie_jar,
+            Arc::new(default_stealth_profile().clone()),
+            proxy_url,
+            allow_private_network,
+        )
+    }
+
+    /// The identity this client is presenting.
+    pub fn profile(&self) -> &obscura_stealth::StealthProfile {
+        &self.profile
+    }
+
+    /// Build a client that wears `profile`.
+    ///
+    /// The emulation comes from the profile's own `tls_impersonate` and OS, so
+    /// the handshake belongs to the browser the user agent names. A profile
+    /// reaches here only after `validate()`, which is what ties those two
+    /// together.
+    pub fn with_profile(
+        cookie_jar: Arc<CookieJar>,
+        profile: Arc<obscura_stealth::StealthProfile>,
+        proxy_url: Option<&str>,
+        allow_private_network: bool,
+    ) -> Self {
+        let emulation_opts = crate::identity::emulation_for(&profile);
 
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
@@ -263,6 +309,7 @@ impl StealthHttpClient {
 
         StealthHttpClient {
             client,
+            profile,
             allow_private_network,
             block_trackers: tracker_blocking_enabled(
                 std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
@@ -790,6 +837,7 @@ mod tests {
         let (port, server) = reset_fixture(false);
         let client = StealthHttpClient {
             client: wreq::Client::builder().no_proxy().build().unwrap(),
+            profile: Arc::new(obscura_stealth::default_profile()),
             allow_private_network: true,
             block_trackers: true,
             cookie_jar: Arc::new(CookieJar::new()),

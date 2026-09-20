@@ -43,7 +43,10 @@ impl WorkerResponse {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter("warn")
+        // Same reasoning as the CLI's own filter: `usvg` warns once per
+        // malformed attribute in the page's markup, which is noise the engine
+        // cannot act on. See DEFAULT_LOG_FILTER in main.rs.
+        .with_env_filter("warn,usvg=error,resvg=error,svgtypes=error")
         .with_writer(std::io::stderr)
         .init();
 

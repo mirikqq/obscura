@@ -514,6 +514,47 @@ impl Drop for ObscuraJsRuntime {
     }
 }
 
+/// The zone `OBSCURA_TIMEZONE` names, when it names one.
+pub(crate) fn configured_timezone() -> Option<String> {
+    std::env::var("OBSCURA_TIMEZONE")
+        .ok()
+        .map(|zone| zone.trim().to_string())
+        .filter(|zone| !zone.is_empty())
+}
+
+#[allow(non_snake_case)]
+extern "C" {
+    /// ICU's `ucal_setDefaultTimeZone`, as the V8 build exports it.
+    ///
+    /// V8 statically links ICU 77 and version-suffixes its C symbols -- the
+    /// `v8` crate's own `icu::set_common_data_77` is the same convention.
+    /// Binding the one call we need is what lets the engine report a chosen
+    /// zone on Windows, where the `TZ` variable does not reach ICU at all. If
+    /// a future V8 bump changes the ICU major, this fails to link, which is
+    /// the right way to find out.
+    fn ucal_setDefaultTimeZone_77(zone_id: *const u16, status: *mut i32);
+}
+
+/// Set ICU's default zone. Returns whether it was applied.
+fn set_icu_default_timezone(timezone: &str) -> bool {
+    // ICU takes a null-terminated UTF-16 zone id.
+    let mut zone: Vec<u16> = timezone.encode_utf16().collect();
+    zone.push(0);
+    let mut status: i32 = 0;
+    // Safety: `zone` is a null-terminated UTF-16 buffer that outlives the call,
+    // and `status` is a valid out-parameter. ICU copies the id.
+    unsafe {
+        ucal_setDefaultTimeZone_77(zone.as_ptr(), &mut status);
+    }
+    if status > 0 {
+        // A positive UErrorCode is a failure; an unknown zone id is the usual
+        // cause. Leave the host zone rather than a half-applied one.
+        tracing::warn!(timezone, status, "ICU rejected the timezone");
+        return false;
+    }
+    true
+}
+
 impl ObscuraJsRuntime {
     /// The V8 runtime, with its isolate entered for as long as the returned
     /// guard lives. Every path that touches V8 goes through here; see
@@ -1442,6 +1483,133 @@ impl ObscuraJsRuntime {
         let _ = self.execute_runtime_script(
             "<set-stealth>",
             format!("globalThis.__obscura_stealth = {};", enabled),
+        );
+    }
+
+    /// Point every fingerprint surface at one validated profile.
+    ///
+    /// Before this, `bootstrap.js` invented its own values from a per-process
+    /// seed: a GPU from a pool, a screen from another pool, an audio sample
+    /// rate from a coin flip. Each was individually plausible and none of them
+    /// knew what the transport was claiming, so a macOS user agent could ship
+    /// an NVIDIA-on-Windows renderer, or a 4K screen could arrive with a
+    /// 1366x768 viewport. The combinations were the tell.
+    ///
+    /// Now the same object that built the ClientHello supplies these values,
+    /// and `StealthProfile::validate` has already rejected the contradictions.
+    #[cfg(feature = "stealth")]
+    pub fn set_fingerprint_profile(&mut self, profile: &obscura_net::StealthProfile) {
+        let fp = serde_json::json!({
+            "gpu": profile.gpu_profile.unmasked_renderer,
+            "gpuVendor": profile.gpu_profile.unmasked_vendor,
+            "webglVendor": profile.gpu_profile.vendor,
+            "webglRenderer": profile.gpu_profile.renderer,
+            "audioSampleRate": profile.audio_sample_rate,
+            "screen": [profile.screen_width, profile.screen_height],
+            "availScreen": [profile.screen_avail_width, profile.screen_avail_height],
+            "availTop": profile.screen_avail_top,
+            "colorDepth": profile.screen_color_depth,
+            "devicePixelRatio": profile.device_pixel_ratio,
+            "innerSize": [profile.inner_width, profile.inner_height],
+            "outerSize": [profile.outer_width, profile.outer_height],
+            "hardwareConcurrency": profile.cpu_cores,
+            "deviceMemory": profile.device_memory,
+            "maxTouchPoints": profile.max_touch_points,
+            "language": profile.language,
+            "languages": profile.languages,
+            "timezone": profile.timezone,
+            "vendor": profile.vendor,
+            "vendorSub": profile.vendor_sub,
+            "productSub": profile.product_sub,
+            "appVersion": profile.app_version,
+            "pdfViewerEnabled": profile.pdf_viewer_enabled,
+            "prefersColorScheme": profile.prefers_color_scheme,
+            "pointerType": profile.pointer_type,
+            "hoverCapability": profile.hover_capability,
+            "colorGamut": profile.color_gamut,
+            "connectionEffectiveType": profile.connection_effective_type,
+            "connectionRtt": profile.connection_rtt,
+            "connectionDownlink": profile.connection_downlink,
+            "hasPlatformAuthenticator": profile.has_platform_authenticator,
+            "conditionalMediation": profile.conditional_mediation,
+            "canvasSeed": profile.canvas_seed,
+            "audioSeed": profile.audio_seed,
+            "cpuArchitecture": profile.cpu_architecture,
+            "cpuBitness": profile.cpu_bitness,
+            "uaModel": profile.ua_model,
+            "uaWow64": profile.ua_wow64,
+            "mobile": profile.device_class != obscura_net::DeviceClass::Desktop,
+        });
+        let fp = serde_json::to_string(&fp).unwrap_or_else(|_| "null".into());
+        // `__obscura_hw` / `__obscura_mem` / `__obscura_screen_*` were already
+        // the globals navigator and screen read; feeding them from the profile
+        // keeps the existing getters and adds no new indirection.
+        let _ = self.execute_runtime_script(
+            "<set-fingerprint>",
+            format!(
+                "globalThis.__obscura_fp = {fp};                 globalThis.__obscura_hw = {hw};                 globalThis.__obscura_mem = {mem};                 globalThis.__obscura_screen_w = {sw};                 globalThis.__obscura_screen_h = {sh};",
+                fp = fp,
+                hw = profile.cpu_cores,
+                mem = profile.device_memory,
+                sw = profile.screen_width,
+                sh = profile.screen_height,
+            ),
+        );
+        // An explicitly configured zone is the operator's decision and outranks
+        // the profile's own.
+        self.set_timezone(&configured_timezone().unwrap_or_else(|| profile.timezone.clone()));
+        if let (Some(latitude), Some(longitude)) = (profile.latitude, profile.longitude) {
+            self.set_geolocation(latitude, longitude);
+        }
+    }
+
+    /// Make the isolate report `timezone` rather than the host's.
+    ///
+    /// Set at ICU's default rather than through the `TZ` environment variable.
+    /// `TZ` only reaches ICU on POSIX -- on Windows ICU resolves the zone from
+    /// the Win32 API and ignores the variable entirely, so the CLI's existing
+    /// `OBSCURA_TIMEZONE` handling silently did nothing there and every page
+    /// reported the operator's real zone. Against an exit IP on another
+    /// continent that is the cheapest contradiction a risk engine can check.
+    ///
+    /// Going through ICU also keeps the surfaces consistent with each other,
+    /// which is the part a JS shim gets wrong: `Intl.DateTimeFormat`,
+    /// `Date.prototype.getTimezoneOffset`, the local getters and
+    /// `toLocaleString` all read the same ICU default, so there is no
+    /// Date-versus-Intl mismatch of the kind a previous override here
+    /// introduced.
+    ///
+    /// Process-global, which is sound because the engine holds a single V8
+    /// isolate per process; `nextest` gives each test its own process for the
+    /// same reason.
+    /// Apply `OBSCURA_TIMEZONE`, if the operator set one.
+    ///
+    /// The CLI also exports it as `TZ`, which is enough on POSIX but not on
+    /// Windows, where ICU ignores the variable. Routing it through
+    /// [`Self::set_timezone`] makes the documented flag work on every platform.
+    pub fn apply_configured_timezone(&mut self) {
+        if let Some(zone) = configured_timezone() {
+            self.set_timezone(&zone);
+        }
+    }
+
+    pub fn set_timezone(&mut self, timezone: &str) {
+        if timezone.is_empty() || !timezone.contains('/') {
+            return;
+        }
+        // `TZ` is still set for any POSIX code in-process that reads it
+        // directly (ICU on Linux and macOS among them).
+        std::env::set_var("TZ", timezone);
+        if !set_icu_default_timezone(timezone) {
+            return;
+        }
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        // `Skip` flushes V8's cached offsets without re-detecting the host
+        // zone, which is the point: ICU's default has just been set
+        // deliberately and re-detection would overwrite it with the host's.
+        isolate.date_time_configuration_change_notification(
+            deno_core::v8::TimeZoneDetection::Skip,
         );
     }
 

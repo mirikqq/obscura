@@ -783,12 +783,32 @@ impl DomTree {
                 .and_then(|entry| entry.as_ref())
                 .is_some_and(|child| child.first_child.is_some())
                 || inner.shadow_roots_by_host.contains_key(&child_id);
-            if !parent_exists
-                || !child_exists
-                || inner.shadow_roots.contains_key(&child_id)
-                || (child_can_be_ancestor
-                    && Self::would_create_host_including_cycle(&inner, parent_id, child_id))
+            // Naming the rule that fired. All four rejections surface in JS as
+            // one HierarchyRequestError ("would create an invalid tree"), which
+            // says nothing about which invariant was violated -- and on a real
+            // page the four have completely different causes. Logging the
+            // reason turns an opaque failure into one that can be traced back
+            // to the DOM operation that caused it.
+            let rejection = if !parent_exists {
+                Some("destination parent is not in the tree")
+            } else if !child_exists {
+                Some("child is not in the tree")
+            } else if inner.shadow_roots.contains_key(&child_id) {
+                Some("child is a shadow root, which is never an ordinary child")
+            } else if child_can_be_ancestor
+                && Self::would_create_host_including_cycle(&inner, parent_id, child_id)
             {
+                Some("child is a host-including ancestor of the destination parent")
+            } else {
+                None
+            };
+            if let Some(reason) = rejection {
+                tracing::debug!(
+                    parent = parent_id.index(),
+                    child = child_id.index(),
+                    reason,
+                    "append_child rejected"
+                );
                 return;
             }
             let parent_connected = inner

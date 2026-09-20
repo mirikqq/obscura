@@ -974,6 +974,23 @@ fn handle_http_json_blocking(
             "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": format!("ws://{}/devtools/browser", authority),
         }))?,
+        // A fixed entry, not a view of live state.
+        //
+        // Pages belong to the CdpContext of the WebSocket that created them
+        // (`CdpContext::new_with_shared_context`: "a fresh isolated context per
+        // WebSocket"), and this handler runs on the accept thread with no
+        // access to any of them. There is therefore no cross-connection page
+        // registry to report, and the entry below is a discovery shim: a client
+        // that reads it gets a usable `webSocketDebuggerUrl`, and connecting to
+        // it opens a fresh session like any other WebSocket.
+        //
+        // What it is NOT is an inventory. The id, title and url are constants,
+        // so `url` stays "about:blank" however many pages exist and wherever
+        // they have navigated. Do not build target discovery on this: attaching
+        // to the "page-1" it names fails with "Target not found" on any socket
+        // that did not itself create that page. Reporting real targets across
+        // connections needs a shared registry, which would also mean revisiting
+        // the per-connection isolation this server is built on.
         "list" => serde_json::to_string_pretty(&json!([{
             "description": "",
             "devtoolsFrontendUrl": "",

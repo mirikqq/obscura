@@ -7,7 +7,7 @@ repository.workspace = true
 
 [features]
 default = []
-stealth = ["wreq", "wreq-util", "futures-util"]
+stealth = ["wreq", "wreq-util", "futures-util", "obscura-stealth"]
 
 [dependencies]
 reqwest = { workspace = true }
@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = "0.1"
+obscura-stealth = { workspace = true, optional = true }
 encoding_rs = "0.8"
 tempfile = "3"
 psl = "2"
@@ -27,7 +28,7 @@ futures-util = { version = "0.3", optional = true }
 # Emulation builder reshuffled). A caret requirement let a fresh resolve pull a
 # newer, incompatible rc and broke `cargo build --features stealth` (issue #234).
 # Pin exact versions so the build always resolves to the API wreq_client.rs targets.
-wreq-util = { version = "=3.0.0-rc.12", optional = true, features = ["emulation-compression"] }
+wreq-util = { version = "=3.0.0-rc.12", optional = true, features = ["emulation-compression", "emulation-serde"] }
 
 [dev-dependencies]
 socket2 = "0.6"

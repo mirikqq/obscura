@@ -107,7 +107,7 @@ OBSCURA_BLOCK_TRACKERS=0 obscura --stealth fetch https://example.com
 
 ### `OBSCURA_TIMEZONE`
 
-Pins the process timezone before V8/ICU reads it, so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report one consistent zone. Default `Europe/Berlin`. Set it to match the exit IP's region.
+Sets the zone the engine reports, at ICU's default, so `Date` (the local getters, the `Date(y, m, d)` constructor, `getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` all read one zone, DST included. Overrides the profile's own zone under `--stealth`. Set it to match the exit IP's region.
 
 ```bash
 OBSCURA_TIMEZONE=America/New_York obscura serve
@@ -136,6 +136,73 @@ Opt into picking a random profile per browser context instead of the stable defa
 ```bash
 OBSCURA_ROTATE_PROFILE=1 obscura serve
 ```
+
+## Stealth identity
+
+These apply to `--stealth` builds and select the one validated identity that
+drives the TLS stack, `navigator`, `screen`, the locale and the clock together.
+
+### `OBSCURA_STEALTH_PROFILE`
+
+Pin a named preset, for example `chrome_148_windows`, `chrome_148_macos`,
+`firefox_135_linux`, `pixel_9_pro_chrome_148`.
+
+```bash
+OBSCURA_STEALTH_PROFILE=chrome_148_macos obscura --stealth serve
+```
+
+### `OBSCURA_STEALTH_PROFILE_FILE`
+
+Load a profile from a YAML or JSON file instead. It is validated on load; an
+internally inconsistent file is rejected with the reasons listed.
+
+### `OBSCURA_STEALTH_SEED`
+
+Sample an identity from the Bayesian fingerprint network with this seed. One
+seed means one stable identity, which is what you want pinned to one sticky
+proxy session.
+
+### `OBSCURA_STEALTH_SAMPLE`
+
+Sample a fresh identity per process, unseeded.
+
+## Egress alignment
+
+### `OBSCURA_ALIGN_EGRESS`
+
+Align the identity to the exit address even without a proxy. Without it the
+lookup only runs when a proxy is configured, so an ordinary direct run makes no
+extra request.
+
+### `OBSCURA_NO_EGRESS`
+
+Skip the alignment entirely.
+
+### `OBSCURA_MATCH_LANG`
+
+Also take the exit country's language. Off by default: English reads as
+ordinary from anywhere, and a localised challenge page is unreadable to whoever
+is driving the run.
+
+### `OBSCURA_GEOIP_MMDB`
+
+Path to an existing MaxMind GeoLite2-City database, instead of the one the
+engine caches for itself.
+
+### `OBSCURA_GEOIP_URL`
+
+Where to fetch the GeoLite2 database from. No default: the engine does not
+download a binary database from a source it chose itself. Set this to a MaxMind
+permalink, an internal mirror, or a redistribution you trust.
+
+### `OBSCURA_NO_GEOIP`
+
+Do not use or download a local database; fall back to the HTTP geolocation
+providers.
+
+### `OBSCURA_CACHE_DIR`
+
+Base directory for engine caches, including the GeoIP database.
 
 ## MCP
 

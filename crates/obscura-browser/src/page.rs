@@ -1057,8 +1057,12 @@ impl Page {
             // http://, which only works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy(
+            // One identity per process, already aligned to the egress address
+            // by the time the CLI opens a page. The client and the JS surface
+            // both read it, so they cannot describe different browsers.
+            Some(Arc::new(StealthHttpClient::with_profile(
                 context.cookie_jar.clone(),
+                obscura_net::current_profile(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
             )))
@@ -1743,14 +1747,20 @@ impl Page {
         rt.set_referrer(&self.referrer);
 
         #[cfg(feature = "stealth")]
-        if self.stealth_client.is_some() {
+        if let Some(stealth) = self.stealth_client.as_ref() {
+            // One object drives both halves: the profile this client built its
+            // ClientHello from is the profile the JS surface reports. They
+            // cannot describe different browsers, which is what a site
+            // cross-checks.
+            let profile = stealth.profile();
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            rt.set_user_agent(&profile.user_agent);
             rt.set_platform(
-                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM_VERSION,
+                &profile.platform,
+                &profile.os_name,
+                &profile.platform_version,
             );
+            rt.set_fingerprint_profile(profile);
         } else {
             if let Ok(ua) = self.http_client.user_agent.try_read() {
                 rt.set_user_agent(&ua);
@@ -1760,6 +1770,7 @@ impl Page {
                 &self.context.ua_platform,
                 &self.context.ua_platform_version,
             );
+            rt.apply_configured_timezone();
         }
         #[cfg(not(feature = "stealth"))]
         {
@@ -1771,6 +1782,7 @@ impl Page {
                 &self.context.ua_platform,
                 &self.context.ua_platform_version,
             );
+            rt.apply_configured_timezone();
         }
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);

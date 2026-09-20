@@ -84,7 +84,8 @@ edit instead.
   distinct session ids so Playwright and Puppeteer can open raw page sessions.
 - **obscura-js** — V8/`deno_core` runtime. `js/bootstrap.js` is the DOM/browser shim; `src/ops.rs` bridges JS to Rust DOM ops; `src/runtime.rs` owns the isolate and the per-page `ObscuraState`.
 - **obscura-dom** — DOM tree (`src/tree.rs`).
-- **obscura-net** — HTTP client (`client.rs`), stealth client (`wreq_client.rs`), cookie jar, robots cache, tracker blocklist.
+- **obscura-net** — HTTP client (`client.rs`), stealth client (`wreq_client.rs`), cookie jar, robots cache, tracker blocklist. `identity.rs` resolves a profile's declared stack into the `wreq_util` emulation; `egress.rs` resolves the exit address (local GeoLite2 first, HTTP providers second) and owns the process-wide aligned identity.
+- **obscura-stealth** — the browser identity as one object: `StealthProfile` (navigator, screen, WebGL catalog, client hints, locale, wire stack) with a `validate()` that rejects self-contradicting profiles, `presets` and a Bayesian-network `generator`, `transport` (the stack a profile may claim), `geo` (GeoLite2 lookup) and `behavior` (input timing model). Opens no sockets.
 - **obscura-browser** — the `Page` type, navigation, JS evaluation.
 - **obscura-render** — selector cascade, computed style, retained layout,
   scrolling, text shaping, images/SVG/canvas, and CPU-backed paint. The
@@ -173,6 +174,24 @@ adjustments) are privacy-first anti-fingerprinting: they present a normal,
 consistent browser fingerprint (user agent, timezone, navigator properties, and
 similar surfaces) so ordinary automation traffic is not singled out. They
 contain no bot or automation-abuse payload.
+
+The invariant that matters is *coherence*, not any single value. One
+`obscura_stealth::StealthProfile` drives the TLS stack, the UA, `navigator`,
+`screen`, the window chain, the audio rate and the clock, and `validate()`
+rejects a profile whose fields contradict each other. Two seams keep it honest
+and both are covered by tests that fail the build:
+`transport::expected_emulation` derives the stack a profile may declare (so a
+Firefox UA cannot ship a Chrome ClientHello), and
+`obscura-net::identity::every_supported_emulation_resolves` asserts every name
+that crate offers is one `wreq_util` can actually emit. When adding a preset or
+bumping `wreq-util`, run `cargo test -p obscura-stealth` and
+`cargo nextest run -p obscura-net --features stealth` — these catch the drift.
+
+Timezone is set at ICU's default (`runtime.rs::set_timezone`), not through
+`TZ`: ICU ignores that variable on Windows, and going through ICU is what keeps
+`Date`'s local getters, its constructor and `Intl.DateTimeFormat` on one zone.
+`devicePixelRatio` deliberately does not follow the profile — it describes the
+1x render surface, and there is a test pinning that.
 
 ## Recommended proxy provider: NodeMaven
 

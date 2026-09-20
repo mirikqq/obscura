@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 // Live view for obscura serve.
 //
-// Streams what a headless obscura browser sees to any local browser tab,
-// so you can watch an agent (MCP, Puppeteer, Playwright) work in real time.
+// Streams what a headless obscura browser sees to any local browser tab.
+//
+// Scope: this shows the page THIS viewer owns. The server gives every
+// WebSocket its own isolated CdpContext, so a target created by an agent
+// (MCP, Puppeteer, Playwright) on another connection cannot be attached to
+// from here -- see the note above listAllPages().
 //
 // Usage:
 //   obscura serve --port 9222
-//   node tools/live-view.mjs [cdpPort] [httpPort]
+//   node tools/live-view.mjs [cdpPort] [httpPort] [url]
 //
 // No dependencies. Requires Node 21+ (native WebSocket).
 //
@@ -25,6 +29,8 @@ import { spawn } from "node:child_process";
 
 const cdpPort = process.argv[2] ?? 9222;
 const httpPort = Number(process.argv[3] ?? 8080);
+// Optional page to open in the viewer's own target.
+const startUrl = process.argv[4] ?? null;
 const FAST_MS = 250; // capture cadence right after a visible change
 const IDLE_MS = 1500; // capture cadence while nothing changes
 const MIN_FRAME_BYTES = 100; // ignore blank placeholder frames
@@ -78,9 +84,17 @@ function pickTarget(targets) {
   );
 }
 
-// Target.getTargets only reports targets known to the calling socket,
-// which is useless for watching someone else's session. The HTTP
-// target list shows every page across all connections.
+// Target discovery does not work across connections on this server, and
+// there is no way to make it: pages belong to the CdpContext of the socket
+// that created them, so Target.getTargets legitimately reports only your
+// own. /json/list looks like the way around that but is not -- it is a
+// fixed discovery shim whose id and url are constants (see the "list" arm
+// in obscura-cdp/src/server.rs), so the "page-1" it names cannot be
+// attached to from here.
+//
+// So this viewer shows *its own* page, and `--url` navigates it. Watching
+// an agent's existing session would need a shared target registry the
+// server does not have.
 async function listAllPages() {
   const res = await fetch(`http://127.0.0.1:${cdpPort}/json/list`);
   return res.json();
@@ -157,21 +171,46 @@ function broadcast(base64) {
 // anything else needs an explicit flatten attach.
 async function ensureAttached(call) {
   if (sessionId && targetId) return;
+
+  // Prefer a target this socket already owns. Target.getTargets is the only
+  // list that can be attached to, because a target belongs to the context of
+  // the socket that created it.
   if (!targetId) {
-    const wanted = pickTarget(await listAllPages());
-    if (!wanted) throw new Error("no page target yet");
-    targetId = wanted.id;
+    const { targetInfos = [] } = await call("Target.getTargets").catch(() => ({}));
+    const own = targetInfos.find((t) => t.type === "page");
+    if (own) targetId = own.targetId;
   }
-  try {
-    const attached = await call("Target.attachToTarget", {
-      targetId,
-      flatten: true,
-    });
-    sessionId = attached.sessionId;
-  } catch {
-    sessionId = `${targetId}-session`;
+
+  if (targetId) {
+    try {
+      const attached = await call("Target.attachToTarget", {
+        targetId,
+        flatten: true,
+      });
+      sessionId = attached.sessionId;
+      await call("Page.enable", {}, sessionId);
+      return;
+    } catch {
+      // The target went away, or was never ours. Fall through and make one.
+      targetId = null;
+    }
   }
+
+  // Create and own a page. A freshly created target is auto-attached under
+  // "{targetId}-session", so no explicit attach is needed.
+  const created = await call("Target.createTarget", { url: "about:blank" });
+  targetId = created.targetId;
+  sessionId = `${targetId}-session`;
   await call("Page.enable", {}, sessionId);
+  if (startUrl) {
+    await call("Page.navigate", { url: startUrl }, sessionId);
+    console.log(`navigated to ${startUrl}`);
+  } else {
+    console.log(
+      "showing this viewer's own blank page -- pass a URL to navigate it, " +
+        "e.g. node tools/live-view.mjs 9222 8080 https://example.com"
+    );
+  }
 }
 
 async function connect() {

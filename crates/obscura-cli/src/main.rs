@@ -245,13 +245,25 @@ fn print_banner(port: u16) {
     );
 }
 
+/// Quieten the SVG parser's complaints about the page's own markup.
+///
+/// `usvg` warns per malformed attribute, so one sloppy inline `<svg>` -- say
+/// `preserveAspectRatio="true"`, which a framework emits when it stringifies a
+/// boolean -- produces a WARN line for every element carrying it, on every
+/// render. The warning is not actionable: the attribute is invalid, Chrome
+/// ignores it silently, and the engine already does the same. Drowning a real
+/// warning in that noise costs more than the notice is worth, so these are
+/// raised to ERROR and stay visible under `-v` (which selects `debug`) or an
+/// explicit `RUST_LOG`.
+const DEFAULT_LOG_FILTER: &str = "warn,usvg=error,resvg=error,svgtypes=error";
+
 fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
     if verbose {
         "debug"
     } else if quiet {
         "off"
     } else {
-        "warn"
+        DEFAULT_LOG_FILTER
     }
 }
 
@@ -400,6 +412,32 @@ async fn run_cli() -> anyhow::Result<()> {
     let global_proxy = args.proxy.clone();
     let stealth = args.stealth;
     let obey_robots = args.obey_robots;
+
+    // Resolve the browser identity once, before any page exists.
+    //
+    // The identity has to be aligned to the address the traffic actually leaves
+    // from -- an exit in Stockholm reporting Europe/Paris is the cheapest
+    // contradiction a risk engine can check -- and that alignment needs a
+    // network round trip. Page construction is synchronous, so it happens here,
+    // once, while there is still somewhere to await. Without a proxy the
+    // alignment is skipped entirely and this costs nothing.
+    #[cfg(feature = "stealth")]
+    if stealth {
+        if let Some(ref proxy) = global_proxy {
+            if std::env::var_os("OBSCURA_PROXY").is_none() {
+                unsafe {
+                    std::env::set_var("OBSCURA_PROXY", proxy);
+                }
+            }
+        }
+        let profile = obscura_net::aligned_profile().await;
+        tracing::info!(
+            user_agent = %profile.user_agent,
+            stack = %profile.tls_impersonate,
+            timezone = %profile.timezone,
+            "browser identity"
+        );
+    }
 
     match args.command {
         Some(Command::Serve {
@@ -2221,9 +2259,37 @@ mod tests {
         assert_eq!(content, "rendered output");
     }
 
+    /// The engine's own warnings stay at WARN by default.
     #[test]
     fn default_filter_is_warn() {
-        assert_eq!(select_log_filter(false, false), "warn");
+        assert!(
+            select_log_filter(false, false).starts_with("warn"),
+            "the default level must still be warn, got {:?}",
+            select_log_filter(false, false)
+        );
+    }
+
+    /// `usvg` warns once per malformed attribute in the *page's* markup --
+    /// invalid SVG that Chrome ignores silently and the engine cannot act on.
+    /// One sloppy inline `<svg>` produced a WARN line per element per render,
+    /// which is enough noise to bury a real warning.
+    #[test]
+    fn default_filter_quietens_the_third_party_svg_parser() {
+        let filter = select_log_filter(false, false);
+        for target in ["usvg", "resvg", "svgtypes"] {
+            assert!(
+                filter.contains(&format!("{target}=error")),
+                "{target} should be raised to error in {filter:?}"
+            );
+        }
+    }
+
+    /// Quiet still silences everything, and verbose still shows the SVG
+    /// warnings -- the noise is hidden by default, not thrown away.
+    #[test]
+    fn verbose_and_quiet_are_unaffected_by_the_svg_quietening() {
+        assert_eq!(select_log_filter(false, true), "off");
+        assert_eq!(select_log_filter(true, false), "debug");
     }
 
     #[test]

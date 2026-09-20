@@ -7,13 +7,14 @@ repository.workspace = true
 
 [features]
 default = []
-stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
+stealth = ["obscura-browser/stealth", "obscura-net/stealth", "dep:obscura-stealth"]
 render = ["obscura-browser/render", "dep:base64"]
 
 [dependencies]
 obscura-browser = { workspace = true }
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
+obscura-stealth = { workspace = true, optional = true }
 tokio = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }

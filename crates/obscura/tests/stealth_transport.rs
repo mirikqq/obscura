@@ -6,8 +6,6 @@ use std::time::Duration;
 
 use obscura::Browser;
 
-const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 const ORDINARY_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 
@@ -70,6 +68,15 @@ async fn stealth_transport_requires_compile_time_and_runtime_opt_in() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     std::env::set_var("OBSCURA_PROFILE", "0");
 
-    assert_eq!(navigate_user_agent(true).await, STEALTH_USER_AGENT);
+    // The stealth UA is asserted against the profile rather than a literal.
+    // What matters is that the wire carries the *identity the engine selected*
+    // -- the same object its ClientHello was built from. Pinning a version
+    // string here would only test that nobody bumped the preset.
+    let profile = obscura_net::current_profile();
+    assert_eq!(navigate_user_agent(true).await, profile.user_agent);
+    assert_ne!(
+        profile.user_agent, ORDINARY_USER_AGENT,
+        "stealth must not fall back to the ordinary profile's identity"
+    );
     assert_eq!(navigate_user_agent(false).await, ORDINARY_USER_AGENT);
 }

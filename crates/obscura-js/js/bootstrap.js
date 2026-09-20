@@ -674,9 +674,70 @@ function _fpNoise(x, y, channel) {
   return (_fpRand(x * 7919 + y * 6271 + channel * 8923) - 0.5) * 4;
 }
 
+// The canvas readback is derived from the same seed as the pixel noise, so one
+// identity always produces one canvas hash across navigations in the process.
+function _canvasFingerprintFromSeed() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let cfp = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg';
+  for (let i = 0; i < 40; i++) cfp += chars[Math.floor(_fpRand(500 + i) * 64)];
+  return cfp + '==';
+}
+
 var _fpCache = null;
 function _getFp() {
   if (_fpCache) return _fpCache;
+  // A stealth run supplies one validated profile: the same object the TLS
+  // stack was built from. Taking these values from it is what keeps the WebGL
+  // renderer, the screen and the audio rate consistent with the user agent and
+  // the handshake -- the pools below pick each field independently, so they
+  // can (and did) produce an NVIDIA-on-Windows renderer under a macOS UA.
+  // Deterministic values (canvas/audio noise) still come from the seeded RNG,
+  // which the profile now seeds.
+  const injected = globalThis.__obscura_fp;
+  if (injected) {
+    if (typeof injected.canvasSeed === 'number') _fpSeed = injected.canvasSeed | 0;
+    _fpCache = {
+      gpu: injected.gpu,
+      gpuVendor: injected.gpuVendor,
+      webglVendor: injected.webglVendor,
+      webglRenderer: injected.webglRenderer,
+      audioSampleRate: injected.audioSampleRate,
+      // Not in the profile: these are per-device analogue values with no
+      // cross-field constraint, so the seeded RNG still supplies them -- but
+      // seeded from the profile, so they are stable for one identity.
+      audioBaseLatency: 0.002 + _fpRand(100) * 0.008,
+      compThreshold: -24 + (_fpRand(102) - 0.5) * 4,
+      compKnee: 30 + (_fpRand(103) - 0.5) * 4,
+      compRatio: 12 + (_fpRand(104) - 0.5) * 4,
+      batteryLevel: 0.5 + _fpRand(200) * 0.5,
+      batteryCharging: _fpRand(201) > 0.3,
+      screen: injected.screen,
+      availScreen: injected.availScreen,
+      availTop: injected.availTop,
+      colorDepth: injected.colorDepth,
+      devicePixelRatio: injected.devicePixelRatio,
+      innerSize: injected.innerSize,
+      outerSize: injected.outerSize,
+      hardwareConcurrency: injected.hardwareConcurrency,
+      deviceMemory: injected.deviceMemory,
+      maxTouchPoints: injected.maxTouchPoints,
+      language: injected.language,
+      languages: injected.languages,
+      timezone: injected.timezone,
+      prefersColorScheme: injected.prefersColorScheme,
+      pointerType: injected.pointerType,
+      hoverCapability: injected.hoverCapability,
+      colorGamut: injected.colorGamut,
+      connectionEffectiveType: injected.connectionEffectiveType,
+      connectionRtt: injected.connectionRtt,
+      connectionDownlink: injected.connectionDownlink,
+      hasPlatformAuthenticator: injected.hasPlatformAuthenticator,
+      conditionalMediation: injected.conditionalMediation,
+      pdfViewerEnabled: injected.pdfViewerEnabled,
+      canvasFingerprint: _canvasFingerprintFromSeed(),
+    };
+    return _fpCache;
+  }
   const _uaPlat = globalThis.__obscura_ua_platform || 'Windows';
   const isMac = _uaPlat === 'macOS';
   const isLinux = _uaPlat === 'Linux';
@@ -726,10 +787,7 @@ function _getFp() {
   ];
   const idx = Math.floor(_fpRand(42) * gpuPool.length);
   const screenPool = [[1920,1080],[2560,1440],[1366,768],[1536,864],[1440,900],[1680,1050],[1280,720],[3840,2160]];
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  let cfp = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg';
-  for (let i = 0; i < 40; i++) cfp += chars[Math.floor(_fpRand(500 + i) * 64)];
-  cfp += '==';
+  const cfp = _canvasFingerprintFromSeed();
   _fpCache = {
     gpu: gpuPool[idx], gpuVendor: gpuVendorPool[idx],
     audioBaseLatency: 0.002 + _fpRand(100) * 0.008,
@@ -9355,14 +9413,31 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
   get clonable() { return this._clonable; }
   get serializable() { return this._serializable; }
   _assertInsertable(node, operation) {
-    const createsComposedCycle = node instanceof ShadowRoot
-      || node === this._host
-      || !!(node?.contains && node.contains(this._host));
-    if (createsComposedCycle) {
+    if (node instanceof ShadowRoot) {
       throw new DOMException(
         `Failed to execute '${operation}' on 'Node': The new child would contain the parent.`,
         'HierarchyRequestError'
       );
+    }
+    // Spec: reject when `node` is a *host-including* inclusive ancestor of this
+    // shadow root. The previous check used `contains()`, which walks the light
+    // tree only, so a host sitting inside another shadow tree slipped past --
+    // and was then rejected by the native tree, which has the host-including
+    // rule, with the generic "would create an invalid tree" message. Same
+    // outcome, but attributed to the wrong invariant and much harder to trace.
+    // Walking host edges here keeps both layers on one rule.
+    let current = this._host;
+    // A valid host-including chain is shallow; the bound only guards against a
+    // corrupt tree turning this into a hang.
+    for (let depth = 0; current && depth < 1024; depth++) {
+      if (current === node) {
+        throw new DOMException(
+          `Failed to execute '${operation}' on 'Node': The new child would contain the parent.`,
+          'HierarchyRequestError'
+        );
+      }
+      // A ShadowRoot has no parent; its chain continues at its host.
+      current = current.parentNode || current.host || null;
     }
   }
   appendChild(child) {
@@ -13752,10 +13827,12 @@ _markNative(SpeechSynthesisUtterance);
 _markNative(MediaStream); _markNative(MediaStreamTrack);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
 
-// Timezone is driven by the process TZ (set by the CLI, default Europe/Berlin),
-// so native Intl.DateTimeFormat and Date report the same zone. No JS override:
-// forcing a fixed zone here only on Intl left Date on UTC, which is the exact
-// cross-surface mismatch a fingerprinting script looks for.
+// Timezone is set on the host side, at ICU's default (see
+// `runtime.rs::set_timezone`), so Intl.DateTimeFormat, Date's local getters,
+// the Date constructor and toLocaleString all read one zone and cannot
+// disagree. Deliberately no JS override here: an earlier attempt forced the
+// zone on Intl alone and left Date behind, which is the exact cross-surface
+// mismatch a fingerprinting script looks for.
 
 if (typeof PointerEvent === 'undefined') {
   globalThis.PointerEvent = class PointerEvent extends MouseEvent {
@@ -15448,7 +15525,13 @@ globalThis.__obscura_init = function() {
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
-  _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  // A device does not get a new canvas hash between page loads. Re-seeding per
+  // navigation made the readback differ every time, which is itself the signal
+  // -- vendors compare sequential loads in one session. With a profile the seed
+  // is the profile's, so one identity means one stable hash.
+  _fpSeed = (globalThis.__obscura_fp && typeof globalThis.__obscura_fp.canvasSeed === 'number')
+    ? (globalThis.__obscura_fp.canvasSeed | 0)
+    : (Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0));
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive
@@ -15484,14 +15567,37 @@ globalThis.__obscura_init = function() {
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
   // standalone runtime has the same 1x default as Obscura's render surface.
+  // devicePixelRatio deliberately does NOT follow the profile. It describes
+  // the render surface, not the claimed display: the paint pipeline rasterises
+  // at 1x, so reporting 2x would make devicePixelContentBoxSize and every
+  // screenshot disagree with what script reads. See
+  // `fingerprinted_screen_does_not_invent_a_device_scale_factor`.
   globalThis.devicePixelRatio = 1;
+  // The profile does carry the window chain, which `validate()` guarantees
+  // nests inside its own screen and available area.
   globalThis.innerWidth = vw; globalThis.innerHeight = vh;
-  globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
+  if (globalThis.__obscura_fp && globalThis.__obscura_fp.outerSize) {
+    globalThis.outerWidth = globalThis.__obscura_fp.outerSize[0];
+    globalThis.outerHeight = globalThis.__obscura_fp.outerSize[1];
+  } else {
+    globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
+  }
 
-  var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
-  globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
-  globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
+  // Core count and memory come from the profile when there is one. Drawing
+  // them here from independent pools is how a 1920x1080 desktop could end up
+  // reporting 16 cores with 4 GB, or contradict the values the host already
+  // injected: the pair is sampled together in the profile precisely because
+  // vendors check the combination, not each field.
+  var _fpi = globalThis.__obscura_fp;
+  if (_fpi && _fpi.hardwareConcurrency) {
+    globalThis.__obscura_hw = _fpi.hardwareConcurrency;
+    globalThis.__obscura_mem = _fpi.deviceMemory;
+  } else {
+    var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
+    globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
+    var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
+    globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
+  }
 
   // A navigation start precedes the wall clock, so skew into the past only: an
   // origin ahead of it makes performance.now() and the rAF timestamp negative.

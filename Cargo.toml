@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/obscura-dom",
     "crates/obscura-net",
+    "crates/obscura-stealth",
     "crates/obscura-browser",
     "crates/obscura-cdp",
     "crates/obscura-js",
@@ -21,6 +22,7 @@ repository = "https://github.com/h4ckf0r0day/obscura"
 [workspace.dependencies]
 obscura-dom = { path = "crates/obscura-dom" }
 obscura-net = { path = "crates/obscura-net" }
+obscura-stealth = { path = "crates/obscura-stealth" }
 obscura-browser = { path = "crates/obscura-browser" }
 obscura-cdp = { path = "crates/obscura-cdp" }
 obscura-js = { path = "crates/obscura-js" }
