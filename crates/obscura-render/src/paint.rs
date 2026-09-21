@@ -2505,7 +2505,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         && previous.base_url.as_deref() == base_url
         && !previous.has_dynamic_fonts
         && dynamic_fonts.is_empty()
-        && crate::dom::can_retain_layout_for_tabindex(
+        && crate::dom::can_retain_layout_for_attributes(
             tree,
             viewport,
             stylesheet_cache,

@@ -92,17 +92,26 @@ These tune the browser identity the engine presents so it stays internally consi
 
 ### `OBSCURA_BLOCK_TRACKERS`
 
-Controls the tracker blocklist used by the stealth HTTP transport. It is on by
-default so `--stealth` retains its current privacy-first behavior. Set it to
-`0`, `false`, `no`, or `off` to keep the stealth TLS/browser fingerprint while
-allowing tracker requests.
+Controls the tracker blocklist used by the stealth HTTP transport. Set it to
+`1`, `true`, `yes`, or `on` to drop requests to known analytics and
+fingerprinting hosts.
 
-The setting is read when a stealth client is created. Values are case-insensitive
-and surrounding whitespace is ignored; unset, empty, and unrecognized values keep
-blocking enabled. Non-stealth transport settings and SSRF protection are unchanged.
+**Off by default**, because under `--stealth` it works against the flag it
+ships with. A browser without an extension loads these requests; a client where
+exactly the tracker hosts never arrive is distinguishable from one. The list
+also contains the anti-bot vendors' own endpoints — `static.cloudflareinsights.com`
+among them — so blocking meant asking Cloudflare to clear a challenge while
+withholding the telemetry it expects from a real visitor. It also broke pages
+outright: a site whose script loader saw those requests fail took the rest of
+its application down with them.
+
+Turn it on when privacy or bandwidth matters more than resembling an ordinary
+browser. The setting is read when a stealth client is created; values are
+case-insensitive and surrounding whitespace is ignored. The non-stealth
+transport never blocks, and SSRF protection is unaffected either way.
 
 ```bash
-OBSCURA_BLOCK_TRACKERS=0 obscura --stealth fetch https://example.com
+OBSCURA_BLOCK_TRACKERS=1 obscura --stealth fetch https://example.com
 ```
 
 ### `OBSCURA_TIMEZONE`

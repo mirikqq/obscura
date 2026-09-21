@@ -93,11 +93,23 @@ pub fn stealth_ua_platform_version() -> &'static str {
     &default_stealth_profile().platform_version
 }
 
+/// Whether to drop requests to known analytics and fingerprinting hosts.
+///
+/// Opt-in, because under `--stealth` it works against the flag it ships with.
+/// A browser without an extension loads these; a client where exactly the
+/// tracker hosts never arrive does not look like one. The blocklist also
+/// carries the anti-bot vendors' own endpoints -- `static.cloudflareinsights.com`
+/// among them -- so blocking it meant asking Cloudflare to clear a challenge
+/// while withholding the telemetry Cloudflare expects from a real visitor.
+///
+/// Set `OBSCURA_BLOCK_TRACKERS=1` when privacy or bandwidth matters more than
+/// resembling an ordinary browser. Off, a blocked host is simply fetched like
+/// any other.
 #[cfg(feature = "stealth")]
 fn tracker_blocking_enabled(value: Option<&str>) -> bool {
-    !matches!(
+    matches!(
         value.map(str::trim),
-        Some(value) if matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+        Some(value) if matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     )
 }
 
@@ -358,13 +370,7 @@ impl StealthHttpClient {
 
         if is_tracker_blocked(&current_url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", current_url);
-            return Ok(Response {
-                status: 0,
-                url: current_url,
-                headers: HashMap::new(),
-                body: Vec::new(),
-                redirected_from: Vec::new(),
-            });
+            return Ok(crate::blocklist::blocked_response(&current_url));
         }
 
         let mut redirects = Vec::new();
@@ -542,13 +548,7 @@ impl StealthHttpClient {
     ) -> Result<Response, ObscuraNetError> {
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
-            return Ok(Response {
-                status: 0,
-                url: url.clone(),
-                headers: HashMap::new(),
-                body: Vec::new(),
-                redirected_from: Vec::new(),
-            });
+            return Ok(crate::blocklist::blocked_response(url));
         }
 
         let req_method = method
@@ -657,28 +657,31 @@ mod tests {
 
     const PLAIN_BODY: &str = "<!DOCTYPE html><html><body><p id=\"mark\">gzip ok</p></body></html>";
 
+    /// Blocking is opt-in: under `--stealth` it contradicts the flag, because
+    /// a client whose tracker requests alone never arrive is distinguishable,
+    /// and the list includes the challenge vendors' own beacons.
     #[test]
-    fn tracker_blocking_environment_defaults_to_enabled() {
+    fn tracker_blocking_is_off_unless_asked_for() {
         for value in [
             None,
             Some(""),
-            Some("1"),
-            Some("true"),
-            Some("yes"),
-            Some("on"),
+            Some("0"),
+            Some("false"),
+            Some(" NO "),
+            Some("off"),
             Some("invalid"),
         ] {
             assert!(
-                tracker_blocking_enabled(value),
-                "{value:?} must leave tracker blocking enabled"
+                !tracker_blocking_enabled(value),
+                "{value:?} must leave tracker blocking off"
             );
         }
         for value in [
-            Some("0"), Some("false"), Some(" NO "), Some("off"), Some(" FALSE "),
+            Some("1"), Some("true"), Some(" YES "), Some("on"), Some(" TRUE "),
         ] {
             assert!(
-                !tracker_blocking_enabled(value),
-                "{value:?} must disable tracker blocking"
+                tracker_blocking_enabled(value),
+                "{value:?} must enable tracker blocking"
             );
         }
     }
@@ -724,7 +727,10 @@ mod tests {
         } else {
             client.fetch(&url).await
         }.expect("blocked tracker returns an empty response");
-        assert_eq!(blocked.status, 0);
+        // An empty 200, not a transport error: a page whose script "loaded"
+        // and was empty keeps running, while status 0 made its loader treat
+        // the block as a failure and take the rest of the app down with it.
+        assert_eq!(blocked.status, 200);
         assert!(blocked.body.is_empty());
         assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept())
             .await.is_err());

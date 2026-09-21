@@ -14,7 +14,7 @@ What `--stealth` changes:
 - Uses the wreq HTTP client with browser-matching TLS fingerprints (ClientHello, ALPN, cipher order).
 - Selects one validated browser identity and drives every surface from it: the TLS stack, the User-Agent, `navigator`, `screen`, the window chain, the audio sample rate and the timezone all come from the same profile, so they cannot contradict each other. The profile is rejected at startup if they do.
 - Aligns that identity to the address the traffic actually leaves from, when a proxy is configured.
-- Loads a tracker blocklist that drops requests to known analytics and fingerprinting endpoints.
+- Leaves the tracker blocklist off, so the request pattern matches an ordinary browser. Opt in with `OBSCURA_BLOCK_TRACKERS=1` when privacy or bandwidth matters more (see [Environment variables](Environment-variables.md)).
 - Bundles webpki roots instead of relying on the system store.
 
 Requires a build that includes the stealth feature. Use a `-stealth` archive

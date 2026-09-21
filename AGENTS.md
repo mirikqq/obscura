@@ -30,7 +30,9 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
   avoid touching it when you don't need to.
 - **Stealth:** `--features render,stealth` retains the complete rendering
   surface and adds the wreq/BoringSSL transport, fingerprint protections, and
-  tracker blocklist. BoringSSL builds through CMake, so `cmake` must be
+  an opt-in tracker blocklist (`OBSCURA_BLOCK_TRACKERS=1`; off by default
+  because blocking exactly the tracker hosts is itself a tell, and the list
+  includes the challenge vendors' own beacons). BoringSSL builds through CMake, so `cmake` must be
   installed. The rendering build uses rustls and needs neither CMake nor OpenSSL.
 - If the vendored OpenSSL build hits an AVX-512 assembler error on your host,
   build with `OPENSSL_NO_VENDOR=1`.

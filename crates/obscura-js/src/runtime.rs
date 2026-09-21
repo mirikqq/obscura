@@ -936,7 +936,7 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
+        const IDENTITY_GLOBALS: [&str; 12] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
@@ -944,6 +944,15 @@ impl ObscuraJsRuntime {
             "__obscura_stealth",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
+            // The fingerprint travels with the identity. A frame that reported
+            // a different GPU, screen or core count from its parent would be a
+            // contradiction inside one page -- and comparing the two is one of
+            // the cheapest checks an anti-bot script makes.
+            "__obscura_fp",
+            "__obscura_no_webgl",
+            "__obscura_hw",
+            "__obscura_mem",
+            "__obscura_screen_w",
         ];
 
         let main = self.runtime().main_context();
@@ -1504,6 +1513,11 @@ impl ObscuraJsRuntime {
             "gpuVendor": profile.gpu_profile.unmasked_vendor,
             "webglVendor": profile.gpu_profile.vendor,
             "webglRenderer": profile.gpu_profile.renderer,
+            // The full WebGL surface: extension lists, getParameter values and
+            // shader precision, keyed the way the JS shim looks them up. This
+            // is what makes `getContext("webgl")` able to answer as the GPU the
+            // profile names instead of returning null.
+            "gpuProfile": profile.gpu_profile.webgl_surface(&profile.browser_name),
             "audioSampleRate": profile.audio_sample_rate,
             "screen": [profile.screen_width, profile.screen_height],
             "availScreen": [profile.screen_avail_width, profile.screen_avail_height],
@@ -1547,12 +1561,16 @@ impl ObscuraJsRuntime {
         let _ = self.execute_runtime_script(
             "<set-fingerprint>",
             format!(
-                "globalThis.__obscura_fp = {fp};                 globalThis.__obscura_hw = {hw};                 globalThis.__obscura_mem = {mem};                 globalThis.__obscura_screen_w = {sw};                 globalThis.__obscura_screen_h = {sh};",
+                "globalThis.__obscura_fp = {fp};                 globalThis.__obscura_hw = {hw};                 globalThis.__obscura_mem = {mem};                 globalThis.__obscura_screen_w = {sw};                 globalThis.__obscura_screen_h = {sh};                 globalThis.__obscura_no_webgl = {no_webgl};",
                 fp = fp,
                 hw = profile.cpu_cores,
                 mem = profile.device_memory,
                 sw = profile.screen_width,
                 sh = profile.screen_height,
+                // An escape hatch for a stealth run that also has to render:
+                // the WebGL surface answers about a GPU it cannot draw with,
+                // so a page that renders through WebGL needs the honest null.
+                no_webgl = std::env::var_os("OBSCURA_NO_WEBGL").is_some(),
             ),
         );
         // An explicitly configured zone is the operator's decision and outranks

@@ -1491,13 +1491,7 @@ impl ObscuraHttpClient {
             if let Some(host) = url.host_str() {
                 if crate::blocklist::is_blocked(host) {
                     tracing::debug!("Blocked tracker: {}", url);
-                    return Ok(Response {
-                        status: 0,
-                        url: url.clone(),
-                        headers: HashMap::new(),
-                        body: Vec::new(),
-                        redirected_from: Vec::new(),
-                    });
+                    return Ok(crate::blocklist::blocked_response(url));
                 }
             }
         }

@@ -505,6 +505,16 @@ pub fn retained_attribute_mutation_kind(
     ) || (local == "input" && matches!(name.as_str(), "size" | "type" | "value"))
         || (local == "select" && name == "size")
         || (local == "textarea" && matches!(name.as_str(), "cols" | "rows" | "wrap"))
+        // Native box attributes that layout reads straight off the node rather
+        // than through the cascade: table spans, the media control chrome, and
+        // whether a <details> renders anything past its summary. No selector
+        // mentions them, so a selector-keyed dirty set comes back empty and a
+        // retained layout would silently keep the previous geometry.
+        || (matches!(local.as_str(), "td" | "th")
+            && matches!(name.as_str(), "colspan" | "rowspan"))
+        || (matches!(local.as_str(), "col" | "colgroup") && name == "span")
+        || (matches!(local.as_str(), "audio" | "video") && name == "controls")
+        || (local == "details" && name == "open")
         || matches!(name.as_str(), "dir" | "lang" | "xml:lang")
     {
         return Subtree;
@@ -4079,7 +4089,35 @@ fn retained_style_plan(
 /// A selector-only `tabindex` mutation cannot change layout or paint when the
 /// current stylesheet has no dependency on it. Keep this deliberately narrow:
 /// other zero-dirty attributes can still affect native geometry.
-pub(crate) fn can_retain_layout_for_tabindex(
+/// Whether a batch of attribute writes left every computed style untouched, so
+/// the previous layout is still the right answer.
+///
+/// This used to accept `tabindex` and nothing else, which made the check far
+/// narrower than the fact it rests on. The fact is not about the attribute's
+/// name: a `Selector`-kind attribute can only reach layout through the
+/// stylesheet, and `retained_style_plan` already reports exactly which nodes
+/// the stylesheet makes dirty. An empty dirty set means no element's computed
+/// style changed, and a layout of unchanged styles over an unchanged tree
+/// produces unchanged boxes.
+///
+/// The narrow form cost real time. A page that writes `class`, `data-*` or
+/// `aria-*` -- which React does constantly, and which usually match no rule --
+/// paid a full document layout per write, and the price is paid again on the
+/// next geometry read. Measured on a 3,606-node document, one such write
+/// followed by `getBoundingClientRect` took 90ms, scaling linearly with the
+/// whole document rather than with what changed.
+///
+/// Attributes that reach layout without the stylesheet stay out by
+/// construction: [`retained_attribute_mutation_kind`] classifies as `Subtree`
+/// both `style` and the presentational hints (`hidden`, `width`, `dir`, ...)
+/// and the native box attributes layout reads straight off the node
+/// (`colspan`, `rowspan`, `<col span>`, `<video controls>`, `<details open>`),
+/// and classifies the document-global and resource-selecting ones as `Full`,
+/// so none of them reaches the `Selector` arm below. That classification is
+/// what makes this rule name-agnostic and still sound; an attribute nothing
+/// knows about cannot move a box. Tree mutations do move boxes and are
+/// likewise excluded.
+pub(crate) fn can_retain_layout_for_attributes(
     tree: &DomTree,
     viewport: (f32, f32),
     cache: &mut crate::css::StylesheetCache,
@@ -4088,8 +4126,7 @@ pub(crate) fn can_retain_layout_for_tabindex(
     if mutations.is_empty()
         || !mutations.iter().all(|mutation| {
             matches!(mutation, RetainedStyleMutation::Attribute(attribute)
-                if attribute.name.eq_ignore_ascii_case("tabindex")
-                    && retained_attribute_mutation_kind(tree, attribute.node, &attribute.name)
+                if retained_attribute_mutation_kind(tree, attribute.node, &attribute.name)
                         == RetainedAttributeMutationKind::Selector)
         })
     {
@@ -16964,8 +17001,11 @@ mod tests {
     }
 
     #[test]
-    fn unreferenced_tabindex_can_retain_layout_but_css_dependencies_cannot() {
-        for (css, reusable) in [
+    fn attribute_writes_retain_layout_exactly_when_no_style_changes() {
+        // The stylesheet decides, not the attribute's name. Each case pairs a
+        // rule with whether a write to the named attribute leaves every
+        // computed style untouched.
+        for (css, tabindex_reusable) in [
             ("#target { width: 80px }", true),
             ("[tabindex] { width: 160px }", false),
             ("p::before { content: attr(tabindex) }", false),
@@ -16994,39 +17034,153 @@ mod tests {
             };
 
             assert_eq!(
-                can_retain_layout_for_tabindex(
+                can_retain_layout_for_attributes(
                     &tree,
                     viewport,
                     &mut cache,
                     &[mutation("tabindex")],
                 ),
-                reusable,
+                tabindex_reusable,
                 "{css}"
             );
-            for name in ["data-sized", "style", "hidden", "open"] {
+
+            // The generalisation: an attribute no rule mentions retains the
+            // layout whatever it is called. These are what React writes on
+            // nearly every commit, and each one used to force a full layout.
+            // `open` is here on purpose: the classification is per element,
+            // and only `<details open>` reaches layout. On a paragraph it is
+            // an ordinary inert attribute.
+            for name in ["data-sized", "class", "aria-label", "role", "open"] {
                 assert!(
-                    !can_retain_layout_for_tabindex(
+                    can_retain_layout_for_attributes(
                         &tree,
                         viewport,
                         &mut cache,
                         &[mutation(name)],
                     ),
-                    "{name}"
+                    "{name} matches no rule under {css} and must retain layout"
                 );
             }
-            assert!(!can_retain_layout_for_tabindex(
+
+            // Attributes that reach layout without going through a selector
+            // must still force a rebuild: inline style carries computed values
+            // directly, and the presentational hints enter the UA cascade.
+            for name in ["style", "hidden", "width", "dir"] {
+                assert!(
+                    !can_retain_layout_for_attributes(
+                        &tree,
+                        viewport,
+                        &mut cache,
+                        &[mutation(name)],
+                    ),
+                    "{name} can change layout without a selector"
+                );
+            }
+
+            // A tree change moves boxes, and a resource change re-measures one.
+            assert!(!can_retain_layout_for_attributes(
                 &tree,
                 viewport,
                 &mut cache,
                 &[RetainedStyleMutation::Resource],
             ));
-            assert!(!can_retain_layout_for_tabindex(
+            assert!(!can_retain_layout_for_attributes(
+                &tree,
+                viewport,
+                &mut cache,
+                &[RetainedStyleMutation::Tree(TreeStyleMutation::Remove {
+                    node: target,
+                    old_parent: tree.get_node(target).unwrap().parent.unwrap(),
+                })],
+            ));
+
+            // A different viewport invalidates the cached sheet, so nothing is
+            // retained even when the attribute is inert.
+            assert!(!can_retain_layout_for_attributes(
                 &tree,
                 (600.0, 300.0),
                 &mut cache,
                 &[mutation("tabindex")],
             ));
         }
+    }
+
+    #[test]
+    fn native_box_attributes_rebuild_layout_although_no_selector_matches() {
+        // The dangerous half of a name-agnostic rule. Layout reads these off
+        // the node directly, so the cascade never sees them: the selector
+        // dirty set is empty and every style compares equal, yet the boxes
+        // move. Retaining would leave stale column spans, missing media
+        // controls, and a closed <details> still showing its contents.
+        for (markup, name) in [
+            ("<table><tr><td id=target>a</td><td>b</td></tr></table>", "colspan"),
+            ("<table><tr><td id=target>a</td><td>b</td></tr></table>", "rowspan"),
+            (
+                "<table><colgroup><col id=target></colgroup><tr><td>a</td></tr></table>",
+                "span",
+            ),
+            ("<video id=target></video>", "controls"),
+            (
+                "<details id=target><summary>s</summary><p>body</p></details>",
+                "open",
+            ),
+        ] {
+            let tree = parse_html(markup);
+            let target = tree.get_element_by_id("target").unwrap();
+            let viewport = (500.0, 300.0);
+            let mut cache = crate::css::StylesheetCache::default();
+            let _ = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree,
+                viewport,
+                &HashMap::new(),
+                &[],
+                &mut cache,
+            );
+            assert!(
+                !can_retain_layout_for_attributes(
+                    &tree,
+                    viewport,
+                    &mut cache,
+                    &[RetainedStyleMutation::Attribute(AttributeStyleMutation {
+                        node: target,
+                        name: name.into(),
+                        old_value: None,
+                        new_value: Some("2".into()),
+                    })],
+                ),
+                "{name} reaches layout without going through a selector"
+            );
+        }
+    }
+
+    #[test]
+    fn a_class_write_that_changes_styling_still_rebuilds_layout() {
+        // The other half of the contract: when the rule does apply, the write
+        // must not be retained, or the page would keep a stale box.
+        let tree = parse_html(
+            "<style>.wide { width: 300px }</style><section><p id=target>text</p></section>",
+        );
+        let target = tree.get_element_by_id("target").unwrap();
+        let viewport = (500.0, 300.0);
+        let mut cache = crate::css::StylesheetCache::default();
+        let _ = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree,
+            viewport,
+            &HashMap::new(),
+            &[],
+            &mut cache,
+        );
+        assert!(!can_retain_layout_for_attributes(
+            &tree,
+            viewport,
+            &mut cache,
+            &[RetainedStyleMutation::Attribute(AttributeStyleMutation {
+                node: target,
+                name: "class".into(),
+                old_value: None,
+                new_value: Some("wide".into()),
+            })],
+        ));
     }
 
     #[test]

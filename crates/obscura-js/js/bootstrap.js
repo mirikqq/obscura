@@ -2139,6 +2139,79 @@ function __prepareInsertedScript(script) {
   }
 }
 
+// Custom-element insertion and removal steps.
+//
+// `customElements.define` upgrades what is already in the document, which is
+// enough for a component that ships in the server-rendered markup. Everything
+// created afterwards was left behind: `createElement` produced the right class
+// but its `connectedCallback` never ran, and `innerHTML` produced a plain
+// element that was never upgraded at all. Lit, Polymer and friends render from
+// `connectedCallback`, so a component inserted by an SPA stayed an empty tag --
+// which is how the Epic Games Store's `<egs-navigation>` came out blank.
+//
+// Cost is gated on the registry being non-empty, so a page that defines no
+// custom elements pays one map lookup per insertion and nothing else.
+function _definedCustomElementSelector() {
+  const registry = globalThis.customElements;
+  const definitions = registry && registry._registry;
+  if (!definitions || definitions.size === 0) return null;
+  return Array.from(definitions.keys()).join(',');
+}
+
+function _customElementsInSubtree(root, selector) {
+  const found = [];
+  const seen = new Set();
+  if (root.nodeType === 1 && root.localName && root.localName.indexOf('-') !== -1) {
+    found.push(root);
+    seen.add(root._nid);
+  }
+  const ids = _domParse("query_selector_all_scoped", root._nid, selector) || [];
+  for (const nid of ids) {
+    const el = _wrapEl(+nid);
+    if (el && !seen.has(el._nid)) {
+      found.push(el);
+      seen.add(el._nid);
+    }
+  }
+  return found;
+}
+
+// Upgrade anything newly reachable, then run connectedCallback in tree order.
+function __connectCustomElements(root) {
+  if (!root || root.nodeType === undefined) return;
+  const selector = _definedCustomElementSelector();
+  if (!selector) return;
+  const registry = globalThis.customElements;
+  for (const el of _customElementsInSubtree(root, selector)) {
+    const cls = registry._registry.get(el.localName);
+    if (!cls) continue;
+    if (!el.__customUpgraded) {
+      // Upgrading fires connectedCallback itself when the element is already
+      // in the document, and records that it did.
+      registry._upgradeElement(el, cls);
+      continue;
+    }
+    if (el.__ceConnected) continue;
+    if (typeof el.connectedCallback !== 'function') continue;
+    el.__ceConnected = true;
+    try { el.connectedCallback(); } catch (_error) {}
+  }
+}
+
+// The mirror image: a component that was connected gets disconnectedCallback
+// once it leaves the document, so it can tear down listeners and observers.
+function __disconnectCustomElements(root) {
+  if (!root || root.nodeType === undefined) return;
+  const selector = _definedCustomElementSelector();
+  if (!selector) return;
+  for (const el of _customElementsInSubtree(root, selector)) {
+    if (!el.__ceConnected || el.isConnected) continue;
+    el.__ceConnected = false;
+    if (typeof el.disconnectedCallback !== 'function') continue;
+    try { el.disconnectedCallback(); } catch (_error) {}
+  }
+}
+
 function __prepareInsertedSubtree(root) {
   // HTML's script preparation algorithm leaves a disconnected script
   // unstarted.  When an ancestor is later connected, insertion steps visit
@@ -2159,6 +2232,7 @@ function __prepareInsertedSubtree(root) {
     }
   }
   for (const script of scripts) __prepareInsertedScript(script);
+  __connectCustomElements(root);
 }
 
 function _seedDetachedTreeState(node) {
@@ -2210,7 +2284,20 @@ class Node {
   get baseURI() {
     try { return _documentBase(); } catch (e) { return ""; }
   }
-  get textContent() { return _domParse("text_content", this._nid) ?? ""; }
+  get textContent() {
+    // Cached against the DOM mutation epoch, the same way parentNode caches
+    // against the tree epoch. Each miss is a full round trip -- op_dom into
+    // Rust, a walk of the whole subtree, a JSON encode and a JSON parse back
+    // -- and React reads this constantly while hydrating: profiling the Epic
+    // Games Store recorded 10,412 reads costing 2.6 seconds, the single
+    // largest item on the page. The reads repeat on unchanged nodes, so they
+    // are nearly all hits.
+    if (this._textEpoch === _domMutationEpoch) return this._textValue;
+    const value = _domParse("text_content", this._nid) ?? "";
+    this._textValue = value;
+    this._textEpoch = _domMutationEpoch;
+    return value;
+  }
   set textContent(v) {
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     for (const c of oldChildren) {
@@ -2320,6 +2407,7 @@ class Node {
       _linkedStylesheetNodes.delete(c);
     }
     const parentConnected = this.isConnected;
+    const wasConnected = parentConnected && c.isConnected;
     const removed = _dom("remove_child", c._nid) === "true";
     if (!removed) {
       throw new DOMException(
@@ -2331,6 +2419,7 @@ class Node {
     _seedDetachedTreeState(c);
     _detachStyleSheetsInSubtree(c);
     _reconcileWindowNamedProperties(removedWindowNames);
+    if (wasConnected) __disconnectCustomElements(c);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
     return c;
   }
@@ -3514,6 +3603,17 @@ class Element extends Node {
     // before script can synchronously read `window.someId`.
     _registerWindowNamedTree(this);
     _reconcileWindowNamedProperties(previousWindowNames);
+    // Fragment parsing bypasses appendChild, so the custom elements it creates
+    // reach the document without passing the insertion steps. Upgrading them
+    // here is what makes `innerHTML = "<my-widget>"` produce a component
+    // rather than an inert tag.
+    //
+    // Only the custom-element half: scripts inserted through innerHTML must
+    // not run, so the script preparation in __prepareInsertedSubtree is
+    // deliberately not invoked here.
+    if (this.isConnected) {
+      __connectCustomElements(this);
+    }
     if (globalThis.__mutationObservers?.length) {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
@@ -7220,8 +7320,241 @@ globalThis.Notification = class Notification {
   constructor() {}
 };
 
-globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
-globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
+// --- WebGL surface (stealth only) -------------------------------------------
+//
+// Off by default, and deliberately so: the renderer has no WebGL backend, so
+// these contexts answer questions about a GPU they cannot draw with. A page
+// that feature-detects WebGL and then *renders* through it gets a blank
+// canvas, which is the reason `getContext` returned null here in the first
+// place.
+//
+// Under `--stealth` the trade runs the other way. A browser whose
+// `getContext('webgl')` returns null does not exist in the wild, so the
+// absence is a stronger signal than anything this surface could get wrong --
+// every modern anti-bot vendor reads UNMASKED_RENDERER_WEBGL, the extension
+// list and the shader precision. Those come from the profile's captured GPU
+// catalog (`obscura-stealth::gpu`), so a page reads one real card's surface,
+// consistent with the user agent and the TLS stack it arrived on.
+//
+// `OBSCURA_NO_WEBGL=1` puts the truthful null back for a stealth run that also
+// has to render.
+const _glState = new WeakMap();
+
+function _webglEnabled() {
+  return !!(globalThis.__obscura_stealth
+    && globalThis.__obscura_fp
+    && globalThis.__obscura_fp.gpuProfile
+    && !globalThis.__obscura_no_webgl);
+}
+
+// The WebGL 2 surface, and the WebGL 1 surface derived from it. A WebGL 1
+// context advertising WebGL-2-only extensions or the "WebGL 2.0" version
+// string is a cross-API contradiction a script can catch in two calls.
+function _glSurface(ctx) {
+  const gpu = globalThis.__obscura_fp && globalThis.__obscura_fp.gpuProfile;
+  if (!gpu) return null;
+  const state = ctx ? _glState.get(ctx) : null;
+  // Anything that is not a context handed back by getContext('webgl') gets the
+  // WebGL 2 surface, including getParameter.call(notAContext).
+  if (state && state.isWebGL2 === false && gpu.webgl1) {
+    return {
+      vendor: gpu.vendor,
+      renderer: gpu.renderer,
+      version: gpu.webgl1.version,
+      shadingLang: gpu.webgl1.shadingLang,
+      unmaskedVendor: gpu.unmaskedVendor,
+      unmaskedRenderer: gpu.unmaskedRenderer,
+      extensions: gpu.webgl1.extensions,
+      params: gpu.params,
+      shaderPrec: gpu.shaderPrec,
+    };
+  }
+  return gpu;
+}
+
+class _WebGLBase {
+  getParameter(pname) {
+    const gpu = _glSurface(this);
+    if (!gpu) return null;
+    if (pname === 0x1F00) return gpu.vendor;
+    if (pname === 0x1F01) return gpu.renderer;
+    if (pname === 0x1F02) return gpu.version;
+    if (pname === 0x8B8C) return gpu.shadingLang;
+    if (pname === 0x9245) return gpu.unmaskedVendor;
+    if (pname === 0x9246) return gpu.unmaskedRenderer;
+    // Runtime-dependent, not from the catalog.
+    if (pname === 0x0BA2) {
+      const st = _glState.get(this);
+      return [0, 0, (st && st.width) || 300, (st && st.height) || 150];
+    }
+    const value = gpu.params && gpu.params[String(pname)];
+    return value === undefined ? null : value;
+  }
+  getSupportedExtensions() {
+    const gpu = _glSurface(this);
+    return gpu && gpu.extensions ? gpu.extensions.slice() : [];
+  }
+  getExtension(name) {
+    if (name === 'WEBGL_debug_renderer_info') {
+      return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+    }
+    // Must agree with this context's own list: a stub for an extension the
+    // list omits contradicts the list, and scripts check exactly that pairing.
+    const exts = this.getSupportedExtensions();
+    return exts && exts.indexOf(name) !== -1 ? {} : null;
+  }
+  getShaderPrecisionFormat(shaderType, precisionType) {
+    const gpu = _glSurface(this);
+    const key = String(shaderType) + ':' + String(precisionType);
+    const found = gpu && gpu.shaderPrec && gpu.shaderPrec[key];
+    if (found) {
+      return { rangeMin: found.rangeMin, rangeMax: found.rangeMax, precision: found.precision };
+    }
+    return { rangeMin: 127, rangeMax: 127, precision: 23 };
+  }
+  getContextAttributes() {
+    return {
+      alpha: true, antialias: true, depth: true,
+      failIfMajorPerformanceCaveat: false, powerPreference: 'default',
+      premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false,
+      desynchronized: false, xrCompatible: false,
+    };
+  }
+  get canvas() { const st = _glState.get(this); return (st && st.canvas) || null; }
+  get drawingBufferWidth() { const st = _glState.get(this); return (st && st.width) || 300; }
+  get drawingBufferHeight() { const st = _glState.get(this); return (st && st.height) || 150; }
+  isContextLost() { return false; }
+  getError() { return 0; }
+  checkFramebufferStatus() { return 0x8CD5; }
+  createShader() { return { _id: 1 }; }
+  createProgram() { return { _id: 1 }; }
+  createBuffer() { return { _id: 1 }; }
+  createTexture() { return { _id: 1 }; }
+  createFramebuffer() { return { _id: 1 }; }
+  createRenderbuffer() { return { _id: 1 }; }
+  getShaderInfoLog() { return ''; }
+  getProgramInfoLog() { return ''; }
+  getShaderParameter() { return true; }
+  getProgramParameter() { return true; }
+  getUniformLocation() { return { _id: 0 }; }
+  getAttribLocation() { return 0; }
+}
+
+// State setters and draw calls. Declared from a list so the prototype carries
+// the right names without eighty empty bodies; each gets its own named
+// function so `fn.name` matches, as it does on a real context.
+for (const _glMethod of [
+  'shaderSource', 'compileShader', 'attachShader', 'linkProgram', 'useProgram',
+  'uniform1f', 'uniform1i', 'uniform2f', 'uniform3f', 'uniform4f', 'uniformMatrix4fv',
+  'bindBuffer', 'bufferData', 'enableVertexAttribArray', 'disableVertexAttribArray',
+  'vertexAttribPointer', 'drawArrays', 'drawElements', 'bindTexture', 'texImage2D',
+  'texParameteri', 'activeTexture', 'generateMipmap', 'bindFramebuffer',
+  'framebufferTexture2D', 'bindRenderbuffer', 'renderbufferStorage',
+  'framebufferRenderbuffer', 'enable', 'disable', 'blendFunc', 'blendEquation',
+  'depthFunc', 'depthMask', 'colorMask', 'scissor', 'pixelStorei', 'viewport',
+  'clear', 'clearColor', 'clearDepth', 'clearStencil', 'flush', 'finish',
+  'deleteShader', 'deleteProgram', 'deleteBuffer', 'deleteTexture',
+  'deleteFramebuffer', 'deleteRenderbuffer', 'cullFace', 'frontFace', 'lineWidth',
+]) {
+  if (_WebGLBase.prototype[_glMethod]) continue;
+  Object.defineProperty(_WebGLBase.prototype, _glMethod, {
+    value: ({ [_glMethod]() {} })[_glMethod],
+    writable: true, configurable: true, enumerable: false,
+  });
+}
+
+// Real Chrome has WebGLRenderingContext !== WebGL2RenderingContext, and a
+// webgl2 context reports its own constructor. Aliasing the two was a one-line
+// tell, so they stay distinct classes over one implementation.
+globalThis.WebGLRenderingContext = class WebGLRenderingContext extends _WebGLBase {};
+globalThis.WebGL2RenderingContext = class WebGL2RenderingContext extends _WebGLBase {};
+
+// The constants scripts read off the context (gl.MAX_TEXTURE_SIZE and friends).
+// Chrome carries them on both the constructor and the prototype.
+const _GL_CONSTANTS = {
+  DEPTH_BUFFER_BIT: 0x0100, STENCIL_BUFFER_BIT: 0x0400, COLOR_BUFFER_BIT: 0x4000,
+  POINTS: 0, LINES: 1, LINE_LOOP: 2, LINE_STRIP: 3, TRIANGLES: 4,
+  TRIANGLE_STRIP: 5, TRIANGLE_FAN: 6,
+  ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893,
+  FRAGMENT_SHADER: 0x8B30, VERTEX_SHADER: 0x8B31,
+  COMPILE_STATUS: 0x8B81, LINK_STATUS: 0x8B82,
+  RGBA: 0x1908, RGB: 0x1907, UNSIGNED_BYTE: 0x1401, FLOAT: 0x1406,
+  TEXTURE_2D: 0x0DE1, TEXTURE0: 0x84C0,
+  VENDOR: 0x1F00, RENDERER: 0x1F01, VERSION: 0x1F02,
+  SHADING_LANGUAGE_VERSION: 0x8B8C, VIEWPORT: 0x0BA2,
+  MAX_TEXTURE_SIZE: 0x0D33, MAX_CUBE_MAP_TEXTURE_SIZE: 0x851C,
+  MAX_RENDERBUFFER_SIZE: 0x84E8, MAX_3D_TEXTURE_SIZE: 0x8073,
+  MAX_VERTEX_ATTRIBS: 0x8869, MAX_VERTEX_UNIFORM_VECTORS: 0x8DFB,
+  MAX_VARYING_VECTORS: 0x8DFD, MAX_FRAGMENT_UNIFORM_VECTORS: 0x8DFC,
+  MAX_TEXTURE_IMAGE_UNITS: 0x8872, MAX_VERTEX_TEXTURE_IMAGE_UNITS: 0x8B4D,
+  MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0x8B4C, MAX_VIEWPORT_DIMS: 0x0D3A,
+  ALIASED_LINE_WIDTH_RANGE: 0x846E, ALIASED_POINT_SIZE_RANGE: 0x846D,
+  MAX_SAMPLES: 0x8D57, SAMPLES: 0x80A9,
+  RED_BITS: 0x0D52, GREEN_BITS: 0x0D53, BLUE_BITS: 0x0D54,
+  ALPHA_BITS: 0x0D55, DEPTH_BITS: 0x0D56, STENCIL_BITS: 0x0D57,
+  LOW_FLOAT: 0x8DF0, MEDIUM_FLOAT: 0x8DF1, HIGH_FLOAT: 0x8DF2,
+  LOW_INT: 0x8DF3, MEDIUM_INT: 0x8DF4, HIGH_INT: 0x8DF5,
+  FRAMEBUFFER: 0x8D40, RENDERBUFFER: 0x8D41, FRAMEBUFFER_COMPLETE: 0x8CD5,
+  UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246,
+  DEPTH_TEST: 0x0B71, BLEND: 0x0BE2, CULL_FACE: 0x0B44,
+  STATIC_DRAW: 0x88E4, DYNAMIC_DRAW: 0x88E8, STREAM_DRAW: 0x88E0,
+  NEAREST: 0x2600, LINEAR: 0x2601,
+  TEXTURE_MAG_FILTER: 0x2800, TEXTURE_MIN_FILTER: 0x2801,
+  TEXTURE_WRAP_S: 0x2802, TEXTURE_WRAP_T: 0x2803,
+  CLAMP_TO_EDGE: 0x812F, REPEAT: 0x2901,
+  NO_ERROR: 0, INVALID_ENUM: 0x0500, INVALID_VALUE: 0x0501,
+  INVALID_OPERATION: 0x0502, OUT_OF_MEMORY: 0x0505,
+};
+
+function _installGlSurface(Ctor) {
+  for (const key of Object.keys(_GL_CONSTANTS)) {
+    const value = _GL_CONSTANTS[key];
+    const descriptor = { value, writable: false, enumerable: false, configurable: false };
+    Object.defineProperty(Ctor, key, descriptor);
+    Object.defineProperty(Ctor.prototype, key, descriptor);
+  }
+  Object.defineProperty(Ctor.prototype, Symbol.toStringTag, {
+    value: Ctor.name, writable: false, enumerable: false, configurable: true,
+  });
+  _markNative(Ctor);
+}
+_installGlSurface(globalThis.WebGLRenderingContext);
+_installGlSurface(globalThis.WebGL2RenderingContext);
+for (const key of Object.getOwnPropertyNames(_WebGLBase.prototype)) {
+  const descriptor = Object.getOwnPropertyDescriptor(_WebGLBase.prototype, key);
+  if (!descriptor) continue;
+  if (typeof descriptor.value === 'function') _markNative(descriptor.value);
+  if (typeof descriptor.get === 'function') _markNative(descriptor.get);
+}
+
+function _createWebGLContext(canvas, type) {
+  if (!_webglEnabled()) return null;
+  const isV2 = type === 'webgl2';
+  // A canvas has exactly one context. Chrome returns null when a second
+  // getContext asks for a different type, and hands back the same object when
+  // it asks for the same one -- two lines for any script to check.
+  if (canvas && canvas._glCtx) {
+    const existing = _glState.get(canvas._glCtx);
+    return existing && existing.isWebGL2 === isV2 ? canvas._glCtx : null;
+  }
+  if (canvas && canvas._ctx) return null;
+  const gl = isV2
+    ? new globalThis.WebGL2RenderingContext()
+    : new globalThis.WebGLRenderingContext();
+  _glState.set(gl, {
+    canvas: canvas || null,
+    isWebGL2: isV2,
+    width: (canvas && canvas.width) || 300,
+    height: (canvas && canvas.height) || 150,
+  });
+  if (canvas) {
+    Object.defineProperty(canvas, '_glCtx', {
+      value: gl, writable: true, enumerable: false, configurable: true,
+    });
+  }
+  return gl;
+}
+
 
 class Screen {
   constructor(w, h, availW, availH) {
@@ -9557,8 +9890,13 @@ class CustomElementRegistry {
       if (constructed !== el) {
         throw new TypeError("Custom element constructor did not produce the element being upgraded");
       }
-      if (typeof el.connectedCallback === 'function' && globalThis.document?.contains?.(el)) {
-        try { el.connectedCallback(); } catch (e) {}
+      if (globalThis.document?.contains?.(el)) {
+        // Recorded even when the class has no callback, so the insertion
+        // steps agree with this path about whether the element is connected.
+        el.__ceConnected = true;
+        if (typeof el.connectedCallback === 'function') {
+          try { el.connectedCallback(); } catch (e) {}
+        }
       }
     } catch (e) {
       el.__customUpgradeFailed = true;
@@ -13474,6 +13812,9 @@ globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
 HTMLCanvasElement.prototype.getContext = function getContext(type) {
   if (type === '2d') {
+    // The other half of one-context-per-canvas: once a WebGL context exists,
+    // asking the same canvas for a 2d one returns null, as in Chrome.
+    if (this._glCtx) return null;
     if (!this._ctx) {
       try { this._ctx = new _Canvas2D(this); }
       catch (_error) { return null; }
@@ -13481,12 +13822,16 @@ HTMLCanvasElement.prototype.getContext = function getContext(type) {
     return this._ctx;
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-    // Context creation is allowed to fail, and that is the only truthful
-    // behavior until the renderer has a real WebGL backend. The former shim
-    // reported successful shader/program creation while every draw call was a
-    // no-op. Feature-detecting applications consequently selected their WebGL
-    // path, hid their HTML/image fallback, and produced a blank canvas.
-    return null;
+    // Without a stealth profile this still fails, and that remains the only
+    // truthful answer while the renderer has no WebGL backend: a shim that
+    // reports successful shader/program creation while every draw call is a
+    // no-op makes feature-detecting applications pick their WebGL path, hide
+    // their HTML/image fallback, and paint nothing.
+    //
+    // Under --stealth the calculation inverts -- no real browser returns null
+    // here, so the absence is the louder signal -- and the surface answers
+    // from the profile's captured GPU catalog. See _webglEnabled().
+    return _createWebGLContext(this, type);
   }
   return null;
 };
@@ -15518,6 +15863,131 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   ShadowRoot.prototype.elementsFromPoint = function(x, y) {
     return Document.prototype.elementsFromPoint.call(globalThis.document || this, x, y);
   };
+}
+
+// Object.prototype.toString brands for DOM objects.
+//
+// Every DOM object here answered "[object Object]", and that broke two
+// separate things. Libraries brand-check with Object.prototype.toString.call:
+// Tippy.js decides what counts as an element that way, so `tippy(el)` returned
+// undefined and every page building tooltips through it threw inside React's
+// commit phase -- that is what put the Epic Games Store into its error
+// boundary. It is also a one-line bot check, because no browser reports
+// "[object Object]" for `document`.
+//
+// Most HTML*Element names alias one Element class in this engine, so the brand
+// is a getter over the element's own local name rather than a per-class
+// constant. Unknown tags report HTMLUnknownElement and custom elements report
+// HTMLElement, both as Chrome does.
+const _HTML_INTERFACE_BY_TAG = {
+  __proto__: null,
+  a: 'HTMLAnchorElement', area: 'HTMLAreaElement', audio: 'HTMLAudioElement',
+  base: 'HTMLBaseElement', blockquote: 'HTMLQuoteElement', body: 'HTMLBodyElement',
+  br: 'HTMLBRElement', button: 'HTMLButtonElement', canvas: 'HTMLCanvasElement',
+  caption: 'HTMLTableCaptionElement', col: 'HTMLTableColElement',
+  colgroup: 'HTMLTableColElement', data: 'HTMLDataElement',
+  datalist: 'HTMLDataListElement', del: 'HTMLModElement', details: 'HTMLDetailsElement',
+  div: 'HTMLDivElement',
+  dialog: 'HTMLDialogElement', dl: 'HTMLDListElement', embed: 'HTMLEmbedElement',
+  fieldset: 'HTMLFieldSetElement', form: 'HTMLFormElement', h1: 'HTMLHeadingElement',
+  h2: 'HTMLHeadingElement', h3: 'HTMLHeadingElement', h4: 'HTMLHeadingElement',
+  h5: 'HTMLHeadingElement', h6: 'HTMLHeadingElement', head: 'HTMLHeadElement',
+  hr: 'HTMLHRElement', html: 'HTMLHtmlElement', iframe: 'HTMLIFrameElement',
+  img: 'HTMLImageElement', input: 'HTMLInputElement', ins: 'HTMLModElement',
+  label: 'HTMLLabelElement', legend: 'HTMLLegendElement', li: 'HTMLLIElement',
+  link: 'HTMLLinkElement', map: 'HTMLMapElement', menu: 'HTMLMenuElement',
+  meta: 'HTMLMetaElement', meter: 'HTMLMeterElement', object: 'HTMLObjectElement',
+  ol: 'HTMLOListElement', optgroup: 'HTMLOptGroupElement', option: 'HTMLOptionElement',
+  output: 'HTMLOutputElement', p: 'HTMLParagraphElement', picture: 'HTMLPictureElement',
+  pre: 'HTMLPreElement', progress: 'HTMLProgressElement', q: 'HTMLQuoteElement',
+  script: 'HTMLScriptElement', select: 'HTMLSelectElement', slot: 'HTMLSlotElement',
+  source: 'HTMLSourceElement', span: 'HTMLSpanElement', style: 'HTMLStyleElement',
+  table: 'HTMLTableElement', tbody: 'HTMLTableSectionElement',
+  td: 'HTMLTableCellElement', template: 'HTMLTemplateElement',
+  textarea: 'HTMLTextAreaElement', tfoot: 'HTMLTableSectionElement',
+  th: 'HTMLTableCellElement', thead: 'HTMLTableSectionElement',
+  time: 'HTMLTimeElement', title: 'HTMLTitleElement', tr: 'HTMLTableRowElement',
+  track: 'HTMLTrackElement', ul: 'HTMLUListElement', video: 'HTMLVideoElement',
+};
+// Tags that exist in HTML but share the base HTMLElement interface.
+const _PLAIN_HTML_TAGS = new Set([
+  'abbr', 'address', 'article', 'aside', 'b', 'bdi', 'bdo', 'cite', 'code',
+  'dd', 'dfn', 'dt', 'em', 'figcaption', 'figure', 'footer', 'header',
+  'hgroup', 'i', 'kbd', 'main', 'mark', 'nav', 'noscript', 'rp', 'rt', 'ruby',
+  's', 'samp', 'search', 'section', 'small', 'strong', 'sub', 'summary', 'sup',
+  'u', 'var', 'wbr',
+]);
+
+function _domBrandForElement(element) {
+  const localName = element && element.localName;
+  if (typeof localName !== 'string') return 'Element';
+  // SVG and MathML elements are not HTML interfaces.
+  const namespace = element.namespaceURI;
+  if (namespace === 'http://www.w3.org/2000/svg') {
+    return localName === 'svg' ? 'SVGSVGElement' : 'SVGElement';
+  }
+  if (namespace === 'http://www.w3.org/1998/Math/MathML') return 'MathMLElement';
+  const known = _HTML_INTERFACE_BY_TAG[localName];
+  if (known) return known;
+  // A valid custom element name reports the base interface, as Chrome does
+  // whether or not the element has been upgraded.
+  if (localName.indexOf('-') !== -1) return 'HTMLElement';
+  return _PLAIN_HTML_TAGS.has(localName) ? 'HTMLElement' : 'HTMLUnknownElement';
+}
+
+Object.defineProperty(Element.prototype, Symbol.toStringTag, {
+  get() { return _domBrandForElement(this); },
+  configurable: true,
+});
+
+// The rest of the core DOM interfaces, whose brands are fixed.
+for (const _brandEntry of [
+  [globalThis.Node, 'Node'],
+  [globalThis.CharacterData, 'CharacterData'],
+  [globalThis.Text, 'Text'],
+  [globalThis.Comment, 'Comment'],
+  [globalThis.CDATASection, 'CDATASection'],
+  [globalThis.ProcessingInstruction, 'ProcessingInstruction'],
+  [globalThis.DocumentType, 'DocumentType'],
+  [globalThis.DocumentFragment, 'DocumentFragment'],
+  [globalThis.ShadowRoot, 'ShadowRoot'],
+  [globalThis.Document, 'HTMLDocument'],
+  [globalThis.HTMLCollection, 'HTMLCollection'],
+  [globalThis.NamedNodeMap, 'NamedNodeMap'],
+  [globalThis.Attr, 'Attr'],
+  [globalThis.CSSStyleDeclaration, 'CSSStyleDeclaration'],
+  [globalThis.DOMRect, 'DOMRect'],
+  [globalThis.DOMRectReadOnly, 'DOMRectReadOnly'],
+  [globalThis.Event, 'Event'],
+  [globalThis.CustomEvent, 'CustomEvent'],
+  [globalThis.MouseEvent, 'MouseEvent'],
+  [globalThis.KeyboardEvent, 'KeyboardEvent'],
+  [globalThis.EventTarget, 'EventTarget'],
+  [globalThis.MutationObserver, 'MutationObserver'],
+  [globalThis.IntersectionObserver, 'IntersectionObserver'],
+  [globalThis.ResizeObserver, 'ResizeObserver'],
+  [globalThis.CustomElementRegistry, 'CustomElementRegistry'],
+  [globalThis.Navigator, 'Navigator'],
+  [globalThis.Screen, 'Screen'],
+  [globalThis.Location, 'Location'],
+  [globalThis.Storage, 'Storage'],
+  [globalThis.Headers, 'Headers'],
+  [globalThis.FormData, 'FormData'],
+  [globalThis.AbortController, 'AbortController'],
+  [globalThis.AbortSignal, 'AbortSignal'],
+]) {
+  const _brandCtor = _brandEntry[0];
+  if (!_brandCtor || !_brandCtor.prototype) continue;
+  if (Object.prototype.hasOwnProperty.call(_brandCtor.prototype, Symbol.toStringTag)) continue;
+  Object.defineProperty(_brandCtor.prototype, Symbol.toStringTag, {
+    value: _brandEntry[1], writable: false, enumerable: false, configurable: true,
+  });
+}
+// `window` itself. Its brand lives on the global object, not a prototype.
+if (!Object.prototype.hasOwnProperty.call(globalThis, Symbol.toStringTag)) {
+  Object.defineProperty(globalThis, Symbol.toStringTag, {
+    value: 'Window', writable: false, enumerable: false, configurable: true,
+  });
 }
 
 globalThis.__obscura_init = function() {
