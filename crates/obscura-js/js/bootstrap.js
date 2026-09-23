@@ -48,6 +48,7 @@ const __obscuraCore = globalThis.Deno.core;
     '_blobPartToBytes', '_bytesToBinaryString', '_formEncode', '_hexv',
     '_commonFonts', '_isXMLDocument', '_isValidPITarget', '_isHTMLEl',
     '_nodeList', '_rngNodeLength', '_rngNodeIndex', '_rngSame', '_rngRoot',
+    '_childCollectionsCacheable', '_childNodesOf', '_elementChildrenOf',
     '_rngAncestors', '_rngOrder', '_rngCmp', '_rngCheckOffset',
     '_idbRequest', '_idbObjectStore', '_idbTransaction', '_idbDatabase',
     '_makeListenerBox',
@@ -155,6 +156,52 @@ const _dom = (cmd, a1, a2) => {
   }
   return result;
 };
+
+// Child collections are rebuilt from the host on every access: one
+// `el.children[i]` costs a DOM op, a JSON parse of every child id and a fresh
+// wrapper for each. Indexing one in a loop is therefore O(n) per step and
+// O(n^2) overall -- measured here at 318us per access over 2,000 children and
+// 609us over 4,000, which is what turns a framework's child walk into seconds
+// of blocked event loop while timers and network callbacks wait behind it.
+//
+// Cache the built collection on the node and invalidate it with the tree
+// epoch, the same key `parentNode` uses. Reads inside one epoch also hand back
+// the same object, which is closer to the live collection the spec describes
+// than the fresh snapshot every access produced before.
+//
+// While the parser is still building the document the host adds children with
+// no JS mutation to raise the epoch, so a cache taken mid-parse could go
+// stale. Parsing is not where the quadratic cost bites, so stay uncached until
+// the document is past `loading`.
+function _childCollectionsCacheable() {
+  return globalThis.__documentReadyState__ !== "loading";
+}
+
+function _childNodesOf(node) {
+  if (node._childNodesEpoch === _treeMutationEpoch && _childCollectionsCacheable()) {
+    return node._childNodesValue;
+  }
+  const ids = _domParse("child_nodes", node._nid) || [];
+  const value = _nodeList(ids.map(_wrap).filter(Boolean));
+  if (_childCollectionsCacheable()) {
+    node._childNodesValue = value;
+    node._childNodesEpoch = _treeMutationEpoch;
+  }
+  return value;
+}
+
+function _elementChildrenOf(node) {
+  if (node._childrenEpoch === _treeMutationEpoch && _childCollectionsCacheable()) {
+    return node._childrenValue;
+  }
+  const ids = _domParse("element_children", node._nid) || [];
+  const value = HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
+  if (_childCollectionsCacheable()) {
+    node._childrenValue = value;
+    node._childrenEpoch = _treeMutationEpoch;
+  }
+  return value;
+}
 
 const _nativeFns = new Set();
 // Exact toString override for members whose native form is not just
@@ -2433,10 +2480,7 @@ class Node {
     return parent;
   }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
-  get childNodes() {
-    const ids = _domParse("child_nodes", this._nid) || [];
-    return _nodeList(ids.map(_wrap).filter(Boolean));
-  }
+  get childNodes() { return _childNodesOf(this); }
   get firstChild() { return _wrap(+_dom("first_child", this._nid)); }
   get lastChild() { return _wrap(+_dom("last_child", this._nid)); }
   get nextSibling() {
@@ -3718,10 +3762,7 @@ class Element extends Node {
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
   get innerText() { return this.textContent; }
   set innerText(v) { this.textContent = v; }
-  get children() {
-    const ids = _domParse("element_children", this._nid) || [];
-    return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
-  }
+  get children() { return _elementChildrenOf(this); }
   get content() {
     // <template>.content is a DocumentFragment; <meta>.content reflects
     // the content attribute (read/write per spec). Next.js' next/head
@@ -6289,10 +6330,7 @@ class DocumentFragment extends Node {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
-  get children() {
-    const ids = _domParse("element_children", this._nid) || [];
-    return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
-  }
+  get children() { return _elementChildrenOf(this); }
   get firstElementChild() { return this.children[0] || null; }
   get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
   getElementById(id) {
