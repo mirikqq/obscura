@@ -230,6 +230,20 @@ pub struct StealthHttpClient {
 }
 
 #[cfg(feature = "stealth")]
+/// Per-request ceiling for the stealth transport.
+///
+/// Reads the same `OBSCURA_FETCH_TIMEOUT_MS` the default transport honours.
+/// It used to be hardcoded here, so the documented setting silently did
+/// nothing under `--stealth` -- the one mode where a page's own requests go
+/// through this client.
+fn stealth_request_timeout() -> Duration {
+    let ms = std::env::var("OBSCURA_FETCH_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30_000);
+    Duration::from_millis(ms)
+}
+
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
         Self::with_proxy(cookie_jar, None, false)
@@ -269,7 +283,7 @@ impl StealthHttpClient {
 
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
-            .timeout(Duration::from_secs(30))
+            .timeout(stealth_request_timeout())
             // SSRF guard: reject hostnames that resolve to a private/loopback
             // IP. Use the same opt-in as the `validate_url` calls below so
             // `--allow-private-network` reaches this transport (#793); the

@@ -73,22 +73,30 @@ pub struct Attribute {
 }
 
 impl Attribute {
+    /// The attribute's name as author markup and the DOM spell it.
+    ///
+    /// A present but empty prefix is not a prefix. The parser's foreign-content
+    /// adjustment gives `xmlns` on an `<svg>` a namespace with nothing before
+    /// the colon, and joining that unconditionally produced `:xmlns`, so
+    /// `getAttribute("xmlns")` answered null, `getAttributeNames()` reported
+    /// the wrong name, and `outerHTML` round-tripped SVG into markup no parser
+    /// would read back the same way.
     pub fn qualified_name(&self) -> String {
         match &self.name.prefix {
-            Some(prefix) => format!("{}:{}", prefix, self.name.local),
-            None => self.name.local.to_string(),
+            Some(prefix) if !prefix.is_empty() => format!("{}:{}", prefix, self.name.local),
+            _ => self.name.local.to_string(),
         }
     }
 
     pub fn qualified_name_eq(&self, name: &str) -> bool {
         match &self.name.prefix {
-            Some(prefix) => {
+            Some(prefix) if !prefix.is_empty() => {
                 name.len() == prefix.len() + self.name.local.len() + 1
                     && name.starts_with(prefix.as_ref())
                     && name.as_bytes().get(prefix.len()) == Some(&b':')
                     && &name[prefix.len() + 1..] == self.name.local.as_ref()
             }
-            None => self.name.local.as_ref() == name,
+            _ => self.name.local.as_ref() == name,
         }
     }
 }

@@ -99,9 +99,14 @@ impl DomTree {
                         buf.push_str(tag);
                         for attr in attrs {
                             buf.push(' ');
+                            // An empty prefix is not a prefix: emitting the
+                            // colon anyway turns `xmlns` into `:xmlns`, which
+                            // no parser reads back as the same attribute.
                             if let Some(prefix) = &attr.name.prefix {
-                                buf.push_str(prefix);
-                                buf.push(':');
+                                if !prefix.is_empty() {
+                                    buf.push_str(prefix);
+                                    buf.push(':');
+                                }
                             }
                             buf.push_str(attr.name.local.as_ref());
                             buf.push_str("=\"");
